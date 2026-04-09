@@ -1,0 +1,56 @@
+seed: 7
+
+data:
+  train_csv: data/chexpert_train.csv
+  val_csv: data/chexpert_val.csv
+  image_root: data/chexpert
+  image_col: path
+  mask_col:
+  label_cols:
+    - No Finding
+    - Enlarged Cardiomediastinum
+    - Cardiomegaly
+    - Lung Opacity
+    - Lung Lesion
+    - Edema
+    - Consolidation
+    - Pneumonia
+    - Atelectasis
+    - Pneumothorax
+    - Pleural Effusion
+    - Pleural Other
+    - Fracture
+    - Support Devices
+  image_size: [128, 128]
+  in_channels: 1
+  uncertain_value: 0.0
+  missing_label_value: 0.0
+
+model:
+  latent_dim: 128
+  base_channels: 32
+  num_classes: 14
+  num_seg_classes: 0
+  head_uses_context: true
+
+loss:
+  lambda_cls: 1.0
+  lambda_seg: 0.0
+  lambda_rec: 0.05
+  lambda_dis: 0.01
+  lambda_adjustment: 0.20
+  lambda_cf_stability: 0.10
+  lambda_seg_cf_stability: 0.0
+  lambda_disease_swap: 0.10
+  context_stability_margin: 0.10
+  adjustment_contexts: 4
+
+training:
+  batch_size: 16
+  epochs: 30
+  lr: 0.0003
+  weight_decay: 0.0001
+  num_workers: 4
+  output_dir: runs/chexpert_crn
+  device: auto
+
