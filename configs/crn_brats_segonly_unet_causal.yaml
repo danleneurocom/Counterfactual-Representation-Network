@@ -1,0 +1,77 @@
+seed: 7
+
+data:
+  train_csv: data/brats/brats_train.csv
+  val_csv: data/brats/brats_val.csv
+  image_root:
+  image_col: path
+  mask_col: mask
+  label_cols: []
+  h5_image_key: image
+  h5_mask_key: mask
+  mask_mode: brats_subregions
+  brats_channel_names:
+    - ncr_net
+    - edema
+    - enhancing_tumor
+  brats_region_channels:
+    WT: [0, 1, 2]
+    TC: [0, 2]
+    ET: [2]
+  image_normalization: minmax
+  image_size: [128, 128]
+  in_channels: 4
+  uncertain_value: 0.0
+  missing_label_value: 0.0
+
+model:
+  latent_dim: 128
+  base_channels: 32
+  num_classes: 0
+  num_seg_classes: 3
+  head_uses_context: true
+  segmentation_head: unet
+
+loss:
+  lambda_cls: 0.0
+  lambda_seg: 1.0
+  lambda_region_supervision: 0.0
+  lambda_seg_adjustment: 0.0
+  lambda_region_adjustment: 0.35
+  lambda_rec: 0.0
+  lambda_dis: 0.01
+  lambda_adjustment: 0.0
+  lambda_cf_stability: 0.0
+  lambda_seg_cf_stability: 0.0
+  lambda_region_cf_stability: 0.04
+  lambda_seg_disease_swap: 0.0
+  lambda_region_disease_swap: 0.10
+  lambda_disease_swap: 0.0
+  context_stability_margin: 0.08
+  adjustment_contexts: 4
+
+training:
+  batch_size: 4
+  epochs: 4
+  lr: 0.00003
+  weight_decay: 0.0001
+  num_workers: 4
+  max_train_batches: 2048
+  output_dir: runs/brats_segonly_unet_causal_mainline
+  device: auto
+  init_checkpoint: runs/brats_segonly_unet_causal_warmup/best.pt
+  init_strict: false
+  checkpoint_metric: sweep_best_volume/brats/mean_dice
+  checkpoint_mode: max
+  checkpoint_tiebreak_metric: sweep_best_volume/brats/mean_hd95
+  checkpoint_tiebreak_mode: min
+  checkpoint_threshold: 0.5
+  checkpoint_threshold_sweep: 0.40,0.45,0.50,0.55,0.60,0.65
+  loss_warmup:
+    epochs: 3
+    start_factor: 0.15
+    keys:
+      - lambda_dis
+      - lambda_region_adjustment
+      - lambda_region_cf_stability
+      - lambda_region_disease_swap

@@ -107,8 +107,12 @@ class ImagingCsvDataset(Dataset):
         mask_mode: str = "any",
         mask_channel: int | None = None,
         image_normalization: str = "auto",
+        slice_context: int = 1,
     ) -> None:
         self.frame = pd.read_csv(csv_path)
+        sort_cols = [column for column in ("volume", "slice") if column in self.frame.columns]
+        if sort_cols:
+            self.frame = self.frame.sort_values(sort_cols).reset_index(drop=True)
         self.image_root = image_root
         self.image_col = image_col
         self.label_cols = label_cols or []
@@ -122,10 +126,33 @@ class ImagingCsvDataset(Dataset):
         self.mask_mode = mask_mode
         self.mask_channel = mask_channel
         self.image_normalization = image_normalization
+        self.slice_context = int(slice_context)
+        if self.slice_context <= 0 or self.slice_context % 2 == 0:
+            raise ValueError(f"slice_context must be a positive odd integer, got {self.slice_context}")
 
         missing_cols = [col for col in [image_col, mask_col, *self.label_cols] if col and col not in self.frame]
         if missing_cols:
             raise ValueError(f"Missing columns in {csv_path}: {missing_cols}")
+
+        self._volume_slice_lookup: dict[tuple[int, int], int] = {}
+        self._volume_slice_bounds: dict[int, tuple[int, int]] = {}
+        if self.slice_context > 1:
+            required_context_cols = {"volume", "slice"}
+            missing_context_cols = required_context_cols.difference(self.frame.columns)
+            if missing_context_cols:
+                raise ValueError(
+                    f"slice_context={self.slice_context} requires metadata columns {sorted(required_context_cols)}; "
+                    f"missing {sorted(missing_context_cols)}"
+                )
+            grouped = self.frame.groupby("volume", sort=False)["slice"]
+            self._volume_slice_bounds = {
+                int(volume): (int(values.min()), int(values.max()))
+                for volume, values in grouped
+            }
+            self._volume_slice_lookup = {
+                (int(row.volume), int(row.slice)): int(index)
+                for index, row in self.frame.loc[:, ["volume", "slice"]].reset_index(drop=True).iterrows()
+            }
 
     def __len__(self) -> int:
         return len(self.frame)
@@ -175,13 +202,35 @@ class ImagingCsvDataset(Dataset):
         values[values < 0] = self.uncertain_value
         return torch.tensor(values, dtype=torch.float32)
 
+    def _context_image(self, row: pd.Series) -> Tensor:
+        if self.slice_context == 1 or "volume" not in row.index or "slice" not in row.index:
+            image_path = _resolve_path(self.image_root, row[self.image_col])
+            return self._load_image(image_path)
+
+        half_window = self.slice_context // 2
+        volume_id = int(row["volume"])
+        center_slice = int(row["slice"])
+        min_slice, max_slice = self._volume_slice_bounds[volume_id]
+        slices: list[Tensor] = []
+        for delta in range(-half_window, half_window + 1):
+            slice_id = min(max(center_slice + delta, min_slice), max_slice)
+            lookup_index = self._volume_slice_lookup[(volume_id, slice_id)]
+            context_row = self.frame.iloc[lookup_index]
+            image_path = _resolve_path(self.image_root, context_row[self.image_col])
+            slices.append(self._load_image(image_path))
+        return torch.cat(slices, dim=0)
+
     def __getitem__(self, index: int) -> dict[str, Any]:
         row = self.frame.iloc[index]
         image_path = _resolve_path(self.image_root, row[self.image_col])
         item: dict[str, Any] = {
-            "image": self._load_image(image_path),
+            "image": self._context_image(row),
+            "index": int(index),
             "path": str(image_path),
         }
+        for key in ("volume", "slice"):
+            if key in row.index:
+                item[key] = int(row[key])
         if self.label_cols:
             item["label"] = self._labels(row)
         if self.mask_col:
@@ -210,6 +259,7 @@ def make_dataloader(config: dict[str, Any], split: str, shuffle: bool) -> DataLo
         mask_mode=config.get("mask_mode", "any"),
         mask_channel=config.get("mask_channel"),
         image_normalization=config.get("image_normalization", "auto"),
+        slice_context=int(config.get("slice_context", 1)),
     )
     return DataLoader(
         dataset,
