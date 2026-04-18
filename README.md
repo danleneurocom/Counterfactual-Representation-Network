@@ -97,10 +97,18 @@ Outputs are written to the config's `training.output_dir`.
 For the current strongest BraTS segmentation recipe, use:
 
 ```bash
-PYTHONPATH=src python -m crn.train --config configs/crn_brats_segonly_unet_causal.yaml
+PYTHONPATH=src python -m crn.train --config configs/crn_brats_segonly_unet_causal_contrastive_continue.yaml
 ```
 
-This is the mainline causal-region setup. The `*_memory*.yaml` configs remain available for counterfactual-memory experiments, but they are experimental and have not beaten the mainline model yet.
+This is the current best continued contrastive causal-region setup. If you want the stronger non-contrastive baseline instead, use `configs/crn_brats_segonly_unet_causal.yaml`. The `*_memory*.yaml` configs remain available for counterfactual-memory experiments, but they are experimental and have not beaten the current best model.
+
+To move the same causal mechanism onto a stronger depth-aware backbone, use the new 2.5D causal config:
+
+```bash
+PYTHONPATH=src python -m crn.train --config configs/crn_brats_segonly_unet_causal_contrastive_25d.yaml
+```
+
+This keeps `region_adjustment`, `region_disease_swap`, and lesion-aware contrastive learning, but replaces the planar backbone with a depth-aware slice-stack encoder/decoder. For a quick real-data sanity check before the full run, use `configs/crn_brats_segonly_unet_causal_contrastive_25d_pilot.yaml`.
 
 To try the lesion-aware counterfactual contrastive upgrade on top of the strong causal-region checkpoint, use:
 
@@ -114,6 +122,21 @@ This adds a lesion-aware counterfactual contrastive loss with:
 - positive: backdoor-adjusted same-disease features
 - hard negative: matched disease-swapped counterfactual features
 
+To test which causal terms are responsible for the gain, run the matched continuation ablations:
+
+```bash
+PYTHONPATH=src python -m crn.train --config configs/ablations/crn_brats_ablate_no_contrastive.yaml
+PYTHONPATH=src python -m crn.train --config configs/ablations/crn_brats_ablate_no_region_adjustment.yaml
+PYTHONPATH=src python -m crn.train --config configs/ablations/crn_brats_ablate_no_region_context_stability.yaml
+PYTHONPATH=src python -m crn.train --config configs/ablations/crn_brats_ablate_no_region_disease_swap.yaml
+```
+
+After evaluating or exporting metrics for those runs, summarize the table with:
+
+```bash
+python scripts/summarize_ablation_results.py --output docs/ablation_summary.md
+```
+
 For a quick BraTS sanity check before full training:
 
 ```bash
@@ -123,16 +146,16 @@ PYTHONPATH=src python -m crn.train --config configs/crn_brats_smoke.yaml
 To evaluate a saved checkpoint:
 
 ```bash
-PYTHONPATH=src python -m crn.evaluate --checkpoint runs/brats_crn_multiregion/best.pt --split val --batch-size 8
+PYTHONPATH=src python -m crn.evaluate --checkpoint runs/brats_segonly_unet_causal_contrastive_continue/best.pt --split val --batch-size 8
 ```
 
-This writes a metrics JSON next to the checkpoint, for example `runs/brats_crn_multiregion/best_val_metrics.json`.
+This writes a metrics JSON next to the checkpoint, for example `runs/brats_segonly_unet_causal_contrastive_continue/best_val_metrics.json`.
 
 To run volume-level evaluation with a threshold sweep and export qualitative figures:
 
 ```bash
 PYTHONPATH=src python -m crn.evaluate \
-  --checkpoint runs/brats_crn_multiregion/best.pt \
+  --checkpoint runs/brats_segonly_unet_causal_contrastive_continue/best.pt \
   --split val \
   --batch-size 8 \
   --threshold-sweep 0.35,0.40,0.45,0.50,0.55,0.60,0.65 \
@@ -141,8 +164,8 @@ PYTHONPATH=src python -m crn.evaluate \
 
 This additionally writes:
 
-- `runs/brats_crn_multiregion/best_val_threshold_sweep.json`
-- `runs/brats_crn_multiregion/best_val_qualitative/`
+- `runs/brats_segonly_unet_causal_contrastive_continue/best_val_threshold_sweep.json`
+- `runs/brats_segonly_unet_causal_contrastive_continue/best_val_qualitative/`
 
 The qualitative export saves representative best and worst validation volumes as PNG overlays together with a `summary.json` index.
 It now also exports causal counterfactual image panels for representative volumes:
@@ -159,7 +182,7 @@ To independently tune `WT`, `TC`, and `ET` thresholds with simple 3D post-proces
 
 ```bash
 PYTHONPATH=src python -m crn.evaluate \
-  --checkpoint runs/brats_crn_multiregion/best.pt \
+  --checkpoint runs/brats_segonly_unet_causal_contrastive_continue/best.pt \
   --split val \
   --batch-size 8 \
   --threshold-sweep 0.35,0.40,0.45,0.50,0.55,0.60,0.65 \
@@ -167,7 +190,7 @@ PYTHONPATH=src python -m crn.evaluate \
   --qualitative-count 4
 ```
 
-This also writes `runs/brats_crn_multiregion/best_val_region_tuning.json` with the selected region-wise thresholds and cleanup settings.
+This also writes `runs/brats_segonly_unet_causal_contrastive_continue/best_val_region_tuning.json` with the selected region-wise thresholds and cleanup settings.
 
 The current BraTS configs are now set up for 3-channel subregion segmentation with BraTS region metrics:
 

@@ -319,6 +319,11 @@ def _should_update_best(
 
 
 def _inflate_input_kernel(source: Tensor, target_shape: torch.Size) -> Tensor | None:
+    if source.ndim == 4 and len(target_shape) == 5:
+        if source.shape[0] != target_shape[0] or source.shape[1] != target_shape[1] or source.shape[-2:] != target_shape[-2:]:
+            return None
+        depth = int(target_shape[2])
+        return source.unsqueeze(2).repeat(1, 1, depth, 1, 1) / float(depth)
     if source.ndim != 4 or len(target_shape) != 4:
         return None
     if source.shape[0] != target_shape[0] or source.shape[2:] != target_shape[2:]:
@@ -481,7 +486,12 @@ def build_model(config: dict[str, Any]) -> CounterfactualRepresentationNetwork:
     data_config = config["data"]
     model_config = dict(config["model"])
     slice_context = int(data_config.get("slice_context", 1))
-    model_config.setdefault("in_channels", int(data_config.get("in_channels", 1)) * slice_context)
+    slice_context_layout = str(data_config.get("slice_context_layout", "channels")).lower()
+    if slice_context_layout == "depth":
+        model_config.setdefault("backbone_mode", "2.5d")
+        model_config.setdefault("in_channels", int(data_config.get("in_channels", 1)))
+    else:
+        model_config.setdefault("in_channels", int(data_config.get("in_channels", 1)) * slice_context)
     model_config.setdefault("image_size", data_config.get("image_size", (128, 128)))
     model_config.setdefault("num_classes", len(data_config.get("label_cols") or []))
     model_config.setdefault("num_seg_classes", 1 if data_config.get("mask_col") else 0)

@@ -203,26 +203,34 @@ Taken together, these components form a segmentation framework whose contributio
 
 ## 8. Current Empirical Snapshot
 
-In the current BraTS validation setting, the strongest contrastive version of the framework improves the previous causal-region baseline on volume-level segmentation:
+In the current BraTS validation setting, the strongest contrastive version of the framework is the continued contrastive model, which improves the previous causal-region baseline on volume-level segmentation:
 
 ```text
-Best swept volume mean Dice: 0.7613 -> 0.7703
-Best swept volume mean HD95: 13.27  -> 13.23
-WT Dice: 0.8532 -> 0.8604
-TC Dice: 0.7383 -> 0.7539
-ET Dice: 0.6925 -> 0.6966
+Best swept volume mean Dice: 0.7613 -> 0.7797
+Best swept volume mean HD95: 13.27  -> 11.25
+WT Dice: 0.8532 -> 0.8640
+TC Dice: 0.7383 -> 0.7678
+ET Dice: 0.6925 -> 0.7074
 ```
 
 The gain is not only numerical. The causal counterfactual panels also show the desired qualitative behavior: context interventions usually induce only small output changes, while disease interventions produce larger lesion-relevant effects.
+
+The continuation ablations also clarify which causal terms matter most:
+
+- removing **region adjustment** causes the largest drop
+- removing **region disease swap** causes the second largest drop
+- removing the **lesion-aware contrastive** term causes a smaller but still measurable degradation, especially in HD95
+- removing **region context stability** slightly changes Dice but worsens HD95, indicating that it mainly acts as a geometric regularizer
 
 ## 9. Limitations and Next Steps
 
 The current framework is already causally stronger than the earlier confounder-removal version, but several directions remain open:
 
-- longer contrastive training to see whether the late-stage gains continue
-- stronger ET-focused disease interventions
-- tighter lesion-preservation constraints in counterfactual reconstructions
-- paper-grade quantitative analysis of interpretability behavior
+- tune `lambda_region_cf_stability` downward, since ablations suggest it helps HD95 more than Dice
+- strengthen ET-focused disease interventions, because ET remains the hardest region
+- tighten lesion-preservation constraints in counterfactual reconstructions
+- expand the interpretability study into a paper-grade quantitative analysis
+- complete the new experimental 2.5D depth-aware backbone path and compare it directly against the current best 2D causal model, since the current best benchmark result still comes from the lighter planar backbone
 
 These are natural extensions of the same causal direction rather than departures from it.
 

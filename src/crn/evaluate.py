@@ -390,6 +390,8 @@ def _blank_panel(panel_size: int, label: str) -> Image.Image:
 def _project_image_channels(image: torch.Tensor) -> torch.Tensor:
     if image.ndim == 2:
         return image.float()
+    if image.ndim == 4:
+        return _project_image_channels(image[:, image.shape[1] // 2])
     if image.shape[0] == 1:
         return image[0].float()
     return image.float().mean(dim=0)
@@ -661,6 +663,8 @@ def _export_qualitative_figures(
         mask_mode=data_config.get("mask_mode", "any"),
         mask_channel=data_config.get("mask_channel"),
         image_normalization=data_config.get("image_normalization", "auto"),
+        slice_context=int(data_config.get("slice_context", 1)),
+        slice_context_layout=data_config.get("slice_context_layout", "channels"),
     )
     frame = dataset.frame
     qualitative_dir = Path(qualitative_dir)

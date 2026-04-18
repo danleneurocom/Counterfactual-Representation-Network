@@ -65,3 +65,26 @@ def test_model_supports_group_norm_for_tiny_batch_training() -> None:
     assert outputs["seg_logits"].shape == (1, 3, 32, 32)
     assert any(isinstance(module, nn.GroupNorm) for module in model.modules())
     assert not any(isinstance(module, nn.BatchNorm2d) for module in model.modules())
+
+
+def test_volumetric_backbone_produces_center_slice_segmentation() -> None:
+    model = CounterfactualRepresentationNetwork(
+        in_channels=4,
+        num_classes=0,
+        image_size=(32, 32),
+        latent_dim=8,
+        base_channels=4,
+        num_seg_classes=3,
+        head_uses_context=True,
+        segmentation_head="unet",
+        backbone_mode="2.5d",
+        norm_type="group",
+        group_norm_groups=4,
+    )
+    batch = torch.randn(2, 4, 5, 32, 32)
+    outputs = model(batch)
+    assert outputs["seg_logits"].shape == (2, 3, 32, 32)
+    assert outputs["seg_features"].shape[:2] == (2, 4)
+    assert outputs["reconstruction"].shape == (2, 4, 32, 32)
+    seg_logits = model.segment_from_parts(outputs["z_d"], outputs["z_c"], outputs["disease_features"])
+    assert seg_logits.shape == (2, 3, 32, 32)

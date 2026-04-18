@@ -2,70 +2,118 @@
 
 ## Causal Correction
 
-The original proposal used the disease latent `z_d` as the only input to the prediction heads and treated the context latent `z_c` as information that should be removed from inference. The supervisor feedback points out the causal issue: in a causal graph, confounders are often also causes of the label. Removing them can remove genuine causal parents of `Y`.
+The original proposal treated the context latent `z_c` as information that should be removed from inference, and relied on `z_d` alone for prediction. The supervisor feedback correctly points out the causal issue: under confounding, context variables are often also causes of the target. Removing them from inference can therefore remove genuine causal parents of the output.
 
 The corrected framing is **causal effect estimation under latent confounding**, not confounder removal.
 
-## Model
+## Current Model
 
-For an image `x`, the model learns:
+For an input image `x`, the current framework learns:
 
 ```text
 z_d = E_d(x)
 z_c = E_c(x)
-y_hat = f_cls(z_d, z_c)
 m_hat = f_seg(z_d, z_c)
 x_hat = G(z_d, z_c)
 ```
 
-`z_d` is encouraged to represent disease-related factors. `z_c` represents context, acquisition, anatomy, scanner style, and other latent factors that may be associated with both the image and label.
+In the current BraTS setup:
 
-## Latent Backdoor Adjustment
+- `E_d` and `E_c` are separate encoders
+- `f_seg` is a context-conditioned U-Net decoder
+- the decoder uses disease skip features together with a latent head input formed from both `z_d` and `z_c`
+- `G` is a reconstruction decoder used for counterfactual interpretability
 
-The target estimand is:
+The model is therefore explicitly **confounder-aware**: segmentation depends on both latent components, rather than forcing strict invariance to context.
 
-```text
-p(y | do(z_d)) = integral p(y | z_d, z_c) p(z_c) dz_c
-```
+## Latent Backdoor Adjustment for Segmentation
 
-The minibatch approximation used in this scaffold is:
-
-```text
-p(y | do(z_d_i)) ~= (1 / K) sum_k p(y | z_d_i, z_c_k)
-```
-
-where `z_c_k` is drawn from the current minibatch. This keeps `z_c` in the prediction model, but estimates the disease-factor intervention by averaging over context.
-
-## Counterfactual Swapping
-
-Context swaps should not enforce strict invariance:
+The estimand of interest is:
 
 ```text
-f(z_d_i, z_c_i) == f(z_d_i, z_c_j)
+p(m | do(z_d))
 ```
 
-That assumption implies zero causal influence from `z_c`. Instead, this implementation uses a bounded stability penalty:
+The implementation approximates this by averaging segmentation predictions over a small bank of context latents:
 
 ```text
-max(abs(p_i - p_ij) - margin, 0)
+p(m | do(z_d_i)) ~= (1 / K) sum_k p(m | z_d_i, z_c_k)
 ```
 
-Small context effects are allowed. Large unstable context effects are penalized.
+This preserves the role of `z_c` in the segmentation model while estimating the interventional contribution of the disease factor. In the current mainline training recipe, the adjustment is applied directly to segmentation logits and then supervised at the BraTS region level.
 
-## Training Objective
+## Counterfactual Mechanisms
 
-The implemented objective combines:
+### Context Counterfactuals
+
+Context swaps keep `z_d` fixed and replace `z_c` with a matched alternative context:
+
+```text
+m_cf_ctx = f_seg(z_d, z_c')
+```
+
+We do **not** enforce strict invariance. Instead, we use a bounded stability constraint:
+
+```text
+max(|m_hat - m_cf_ctx| - margin, 0)
+```
+
+This allows small context effects while penalizing unstable context sensitivity.
+
+### Disease Counterfactuals
+
+Disease swaps keep context fixed and replace the disease factor with a matched donor disease latent:
+
+```text
+m_cf_dis = f_seg(z_d', z_c)
+```
+
+This approximates a disease intervention under fixed context, and is supervised using the donor lesion structure.
+
+## BraTS Region-Aware Causal Supervision
+
+The current method is optimized for BraTS region outputs:
+
+- `WT = NCR union ED union ET`
+- `TC = NCR union ET`
+- `ET = ET`
+
+The causal losses are therefore applied at the region level, not just the raw channel level. The current mainline loss combines:
 
 ```text
 L_total =
-    lambda_cls * BCE(f_cls(z_d, z_c), y)
-  + lambda_adjustment * BCE(E_zc[f_cls(z_d, z_c)], y)
-  + lambda_cf_stability * bounded_context_swap(f_cls)
-  + lambda_disease_swap * BCE(f_cls(z_d_donor, z_c), y_donor)
-  + lambda_seg * segmentation_loss(f_seg(z_d, z_c), m)
-  + lambda_rec * reconstruction_loss(G(z_d, z_c), x)
-  + lambda_dis * decorrelation(z_d, z_c)
+    lambda_seg * L_seg
+  + lambda_region_adjustment * L_region_adjustment
+  + lambda_region_cf_stability * L_region_context_stability
+  + lambda_region_disease_swap * L_region_disease_swap
+  + lambda_region_cf_contrastive * L_region_contrastive
+  + lambda_dis * L_decorrelation
 ```
 
-The adjustment and bounded stability terms are the key methodological fixes.
+where:
 
+- `L_region_adjustment` supervises the adjusted `p(m | do(z_d))`
+- `L_region_context_stability` bounds unstable context sensitivity
+- `L_region_disease_swap` supervises matched disease counterfactuals
+- `L_region_contrastive` is a lesion-aware counterfactual contrastive loss
+
+## Lesion-Aware Counterfactual Contrastive Learning
+
+The current strongest model adds a lesion-aware counterfactual contrastive term:
+
+- **anchor**: factual lesion-conditioned segmentation features
+- **positive**: backdoor-adjusted same-disease features
+- **hard negative**: matched disease-swapped counterfactual features
+
+This term strengthens the causal mechanism in the segmentation feature space itself. It does not try to remove context; instead, it encourages disease-consistent lesion features to remain stable after adjustment, while separating them from disease-counterfactual lesion features.
+
+## Current Mainline Interpretation
+
+The current empirical evidence supports the following interpretation:
+
+- `region_adjustment` is the strongest causal component
+- `region_disease_swap` is the next most important causal term
+- the lesion-aware contrastive term provides an additional gain, especially in HD95 and continuation-phase volume performance
+- `region_cf_stability` behaves more like a geometric regularizer: it does not strongly improve Dice, but it helps stabilize HD95
+
+This means the current framework should be described as a **causal region-adjusted segmentation model with matched disease counterfactual supervision and lesion-aware contrastive refinement**, rather than as a pure invariance model.

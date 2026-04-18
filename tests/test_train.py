@@ -1,4 +1,4 @@
-from crn.train import _effective_loss_config, _should_update_best
+from crn.train import _effective_loss_config, _should_update_best, build_model
 
 
 def test_effective_loss_config_warms_selected_terms_only() -> None:
@@ -92,3 +92,26 @@ def test_should_not_update_when_primary_and_tiebreak_are_worse() -> None:
     assert not should_update
     assert primary == 0.74
     assert secondary == 15.0
+
+
+def test_build_model_keeps_modalities_for_depth_layout() -> None:
+    model = build_model(
+        {
+            "data": {
+                "in_channels": 4,
+                "slice_context": 5,
+                "slice_context_layout": "depth",
+                "image_size": [32, 32],
+                "label_cols": [],
+                "mask_col": "mask",
+            },
+            "model": {
+                "latent_dim": 8,
+                "base_channels": 4,
+                "segmentation_head": "unet",
+            },
+        }
+    )
+
+    assert model.backbone_mode == "volumetric"
+    assert model.disease_encoder.stem.net[0].in_channels == 4

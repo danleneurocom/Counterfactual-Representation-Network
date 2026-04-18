@@ -108,6 +108,7 @@ class ImagingCsvDataset(Dataset):
         mask_channel: int | None = None,
         image_normalization: str = "auto",
         slice_context: int = 1,
+        slice_context_layout: str = "channels",
     ) -> None:
         self.frame = pd.read_csv(csv_path)
         sort_cols = [column for column in ("volume", "slice") if column in self.frame.columns]
@@ -127,8 +128,14 @@ class ImagingCsvDataset(Dataset):
         self.mask_channel = mask_channel
         self.image_normalization = image_normalization
         self.slice_context = int(slice_context)
+        self.slice_context_layout = str(slice_context_layout).lower()
         if self.slice_context <= 0 or self.slice_context % 2 == 0:
             raise ValueError(f"slice_context must be a positive odd integer, got {self.slice_context}")
+        if self.slice_context_layout not in {"channels", "depth"}:
+            raise ValueError(
+                "slice_context_layout must be either 'channels' or 'depth', "
+                f"got {self.slice_context_layout!r}"
+            )
 
         missing_cols = [col for col in [image_col, mask_col, *self.label_cols] if col and col not in self.frame]
         if missing_cols:
@@ -205,7 +212,10 @@ class ImagingCsvDataset(Dataset):
     def _context_image(self, row: pd.Series) -> Tensor:
         if self.slice_context == 1 or "volume" not in row.index or "slice" not in row.index:
             image_path = _resolve_path(self.image_root, row[self.image_col])
-            return self._load_image(image_path)
+            image = self._load_image(image_path)
+            if self.slice_context_layout == "depth":
+                return image.unsqueeze(1)
+            return image
 
         half_window = self.slice_context // 2
         volume_id = int(row["volume"])
@@ -218,6 +228,8 @@ class ImagingCsvDataset(Dataset):
             context_row = self.frame.iloc[lookup_index]
             image_path = _resolve_path(self.image_root, context_row[self.image_col])
             slices.append(self._load_image(image_path))
+        if self.slice_context_layout == "depth":
+            return torch.stack(slices, dim=1)
         return torch.cat(slices, dim=0)
 
     def __getitem__(self, index: int) -> dict[str, Any]:
@@ -260,6 +272,7 @@ def make_dataloader(config: dict[str, Any], split: str, shuffle: bool) -> DataLo
         mask_channel=config.get("mask_channel"),
         image_normalization=config.get("image_normalization", "auto"),
         slice_context=int(config.get("slice_context", 1)),
+        slice_context_layout=config.get("slice_context_layout", "channels"),
     )
     return DataLoader(
         dataset,

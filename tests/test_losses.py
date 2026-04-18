@@ -363,3 +363,39 @@ def test_compute_crn_losses_uses_memory_for_single_sample_causal_terms() -> None
     assert torch.isfinite(total)
     assert logs["loss/dis"].item() > 0.0
     assert logs["loss/region_disease_swap"].item() > 0.0
+
+
+def test_compute_crn_losses_supports_volumetric_backbone() -> None:
+    model = CounterfactualRepresentationNetwork(
+        in_channels=4,
+        num_classes=0,
+        image_size=(32, 32),
+        latent_dim=8,
+        base_channels=4,
+        num_seg_classes=3,
+        head_uses_context=True,
+        segmentation_head="unet",
+        backbone_mode="3d",
+        norm_type="group",
+        group_norm_groups=4,
+    )
+    image = torch.randn(2, 4, 5, 32, 32)
+    mask = (torch.rand(2, 3, 32, 32) > 0.8).float()
+    outputs = model(image)
+    total, logs = compute_crn_losses(
+        model,
+        {"image": image, "mask": mask},
+        outputs,
+        LossWeights(
+            lambda_seg=1.0,
+            lambda_region_adjustment=0.25,
+            lambda_region_cf_stability=0.05,
+            lambda_region_disease_swap=0.10,
+            lambda_region_cf_contrastive=0.08,
+            adjustment_contexts=2,
+        ),
+    )
+    assert torch.isfinite(total)
+    assert "loss/region_adjustment" in logs
+    assert "loss/region_disease_swap" in logs
+    assert "loss/region_cf_contrastive" in logs
