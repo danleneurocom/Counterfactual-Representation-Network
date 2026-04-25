@@ -16,12 +16,16 @@ from tqdm import tqdm
 from crn.data import ImagingCsvDataset, make_dataloader
 from crn.losses import backdoor_adjusted_seg_logits, compute_crn_losses
 from crn.metrics import (
+    adebayo_sanity_ratio,
+    axiomatic_soundness,
     binary_segmentation_metrics,
     binary_volume_metrics_from_masks,
     brats_region_arrays_from_volume,
     brats_region_metrics,
     brats_volume_metrics_from_probs,
     classification_metrics,
+    context_invariance_dice,
+    disease_swap_effect,
     multilabel_segmentation_metrics,
     multilabel_volume_metrics_from_probs,
     postprocess_binary_volume,
@@ -397,7 +401,18 @@ def _project_image_channels(image: torch.Tensor) -> torch.Tensor:
     return image.float().mean(dim=0)
 
 
+def _modality_channel(image: torch.Tensor, modality_index: int) -> torch.Tensor | None:
+    if modality_index >= image.shape[0]:
+        return None
+    channel = image[modality_index]
+    if channel.ndim == 3:
+        return channel[channel.shape[0] // 2].float()
+    return _project_image_channels(channel)
+
+
 def _channel_panel(channel: torch.Tensor, panel_size: int, label: str) -> Image.Image:
+    if channel.ndim != 2:
+        channel = _project_image_channels(channel)
     array = channel.detach().cpu().numpy().astype(np.float32)
     array = array - array.min()
     scale = float(array.max())
@@ -791,8 +806,9 @@ def _export_qualitative_figures(
         panel_size = 176
         panels: list[Image.Image] = []
         for modality_index in range(4):
-            if modality_index < image.shape[0]:
-                panels.append(_channel_panel(image[modality_index], panel_size, f"Mod {modality_index + 1}"))
+            modality_channel = _modality_channel(image, modality_index)
+            if modality_channel is not None:
+                panels.append(_channel_panel(modality_channel, panel_size, f"Mod {modality_index + 1}"))
             else:
                 panels.append(_blank_panel(panel_size, f"Mod {modality_index + 1}"))
 
@@ -870,6 +886,240 @@ def _export_qualitative_figures(
     return qualitative_dir
 
 
+def _randomized_disease_encoder_clone(model: torch.nn.Module) -> torch.nn.Module:
+    """Deep-copy the model and re-initialize disease encoder weights (Adebayo 2018).
+
+    Used by M3 Adebayo sanity check: comparing disease-swap effect under the
+    trained encoder vs a randomly-initialized one isolates the contribution
+    of learned disease features from the rest of the architecture.
+    """
+    import copy
+
+    clone = copy.deepcopy(model)
+
+    def _reset(module: torch.nn.Module) -> None:
+        for child in module.children():
+            if hasattr(child, "reset_parameters"):
+                try:
+                    child.reset_parameters()
+                except Exception:
+                    pass
+            _reset(child)
+
+    _reset(clone.disease_encoder)
+    clone.eval()
+    return clone
+
+
+def _resolve_region_channels(data_config: dict[str, Any]) -> dict[str, list[int]]:
+    raw = data_config.get("brats_region_channels") or {"WT": [0, 1, 2], "TC": [0, 2], "ET": [2]}
+    return {name: list(channels) for name, channels in raw.items()}
+
+
+def _compute_counterfactual_metrics(
+    model: torch.nn.Module,
+    data_config: dict[str, Any],
+    split: str,
+    device: torch.device,
+    threshold: float,
+    max_volumes: int | None = None,
+    run_adebayo: bool = True,
+) -> dict[str, float]:
+    """Phase C.2 — M1/M2/M3/M5 counterfactual metrics over every available volume.
+
+    Reuses the reference-bank + CF-generation pattern from
+    `_export_qualitative_figures`, but runs on all volumes and aggregates into
+    mean metrics. Returns a flat dict keyed by `cf/...` tags ready for merge
+    into the top-level eval metrics.
+    """
+    csv_path = data_config.get(f"{split}_csv")
+    if not csv_path:
+        return {}
+
+    dataset = ImagingCsvDataset(
+        csv_path=csv_path,
+        image_root=data_config.get("image_root"),
+        image_col=data_config.get("image_col", "path"),
+        label_cols=data_config.get("label_cols"),
+        mask_col=data_config.get("mask_col"),
+        image_size=tuple(data_config.get("image_size", (128, 128))),
+        in_channels=int(data_config.get("in_channels", 1)),
+        uncertain_value=float(data_config.get("uncertain_value", 0.0)),
+        missing_label_value=float(data_config.get("missing_label_value", 0.0)),
+        h5_image_key=data_config.get("h5_image_key", "image"),
+        h5_mask_key=data_config.get("h5_mask_key", "mask"),
+        mask_mode=data_config.get("mask_mode", "any"),
+        mask_channel=data_config.get("mask_channel"),
+        image_normalization=data_config.get("image_normalization", "auto"),
+        slice_context=int(data_config.get("slice_context", 1)),
+        slice_context_layout=data_config.get("slice_context_layout", "channels"),
+    )
+    if "volume" not in dataset.frame.columns:
+        return {}
+
+    model.eval()
+    reference_bank = _build_counterfactual_reference_bank(model, dataset, device)
+    if not reference_bank:
+        return {}
+
+    region_channels = _resolve_region_channels(data_config)
+
+    volume_ids = dataset.frame["volume"].drop_duplicates().tolist()
+    if max_volumes is not None:
+        volume_ids = volume_ids[: int(max_volumes)]
+
+    m1_logs: list[dict[str, float]] = []
+    m2_logs: list[dict[str, float]] = []
+    m5_logs: list[dict[str, float]] = []
+    m2_factual_per_volume: list[float] = []
+    m2_cf_per_volume: list[float] = []
+
+    for volume_id in volume_ids:
+        row = _representative_row(dataset.frame, int(volume_id))
+        sample = dataset[int(row.name)]
+        with torch.no_grad():
+            outputs = model(sample["image"].unsqueeze(0).to(device))
+            factual_probs = torch.sigmoid(outputs["seg_logits"][0].cpu())
+
+        mask = sample.get("mask")
+        if mask is None:
+            continue
+        target_mask = mask.float()
+        if target_mask.ndim == 3:
+            target_mask = target_mask.unsqueeze(0)
+
+        context_entry, disease_entry = _select_counterfactual_references(
+            reference_bank,
+            outputs["z_d"][0].detach().cpu(),
+            outputs["z_c"][0].detach().cpu(),
+            int(volume_id),
+        )
+
+        if context_entry is not None:
+            ctx_sample = dataset[int(context_entry["row_index"])]
+            with torch.no_grad():
+                ctx_outputs = model(ctx_sample["image"].unsqueeze(0).to(device))
+                ctx_cf = model.refresh_outputs(outputs, ctx_outputs["z_c"])
+                ctx_cf_probs = torch.sigmoid(ctx_cf["seg_logits"][0].cpu())
+            m1_logs.append(
+                context_invariance_dice(factual_probs, ctx_cf_probs, threshold, region_channels)
+            )
+
+        if disease_entry is not None:
+            dis_sample = dataset[int(disease_entry["row_index"])]
+            dis_mask = dis_sample.get("mask")
+            if dis_mask is None:
+                continue
+            dis_target_mask = dis_mask.float()
+            if dis_target_mask.ndim == 3:
+                dis_target_mask = dis_target_mask.unsqueeze(0)
+            with torch.no_grad():
+                dis_outputs = model(dis_sample["image"].unsqueeze(0).to(device))
+                dis_cf = model.segment_outputs_from_parts(
+                    dis_outputs["z_d"], outputs["z_c"], dis_outputs.get("disease_features")
+                )
+                dis_cf_probs = torch.sigmoid(dis_cf["seg_logits"][0].cpu())
+            m2 = disease_swap_effect(
+                factual_probs,
+                dis_cf_probs,
+                target_mask,
+                cf_target_mask=dis_target_mask,
+                threshold=threshold,
+                region_channels=region_channels,
+            )
+            m2_logs.append(m2)
+            m2_factual_per_volume.append(
+                float(np.mean([v for k, v in m2.items() if k.endswith("/dice_factual")]))
+            )
+            m2_cf_per_volume.append(
+                float(np.mean([v for k, v in m2.items() if k.endswith("/dice_cf")]))
+            )
+
+        # M5 Composition + Reversibility: null intervention (z_c → z_c) and
+        # roundtrip z_d → z_d' → z_d using the disease-swap donor as z_d'.
+        with torch.no_grad():
+            null_cf = model.refresh_outputs(outputs, outputs["z_c"])
+            null_probs = torch.sigmoid(null_cf["seg_logits"][0].cpu())
+            if disease_entry is not None:
+                dis_sample = dataset[int(disease_entry["row_index"])]
+                dis_outputs_rt = model(dis_sample["image"].unsqueeze(0).to(device))
+                roundtrip = model.segment_outputs_from_parts(
+                    outputs["z_d"], outputs["z_c"], outputs.get("disease_features")
+                )
+                roundtrip_probs = torch.sigmoid(roundtrip["seg_logits"][0].cpu())
+                del dis_outputs_rt
+            else:
+                roundtrip_probs = factual_probs
+        m5_logs.append(
+            axiomatic_soundness(
+                factual_probs, null_probs, roundtrip_probs,
+                threshold=threshold, region_channels=region_channels,
+            )
+        )
+
+    metrics: dict[str, float] = {}
+    if m1_logs:
+        for key in m1_logs[0]:
+            metrics[key] = float(np.mean([log[key] for log in m1_logs if key in log]))
+    if m2_logs:
+        for key in m2_logs[0]:
+            metrics[key] = float(np.mean([log[key] for log in m2_logs if key in log]))
+    if m5_logs:
+        for key in m5_logs[0]:
+            values = [log[key] for log in m5_logs if key in log and not (isinstance(log[key], float) and np.isnan(log[key]))]
+            metrics[key] = float(np.mean(values)) if values else float("nan")
+
+    # M3 Adebayo sanity: rerun M2 with a randomly-initialized disease encoder.
+    if run_adebayo and m2_logs:
+        dse_trained = float(metrics.get("cf/M2_disease_swap/mean_delta", 0.0))
+        randomized = _randomized_disease_encoder_clone(model).to(device)
+        rand_deltas: list[float] = []
+        for volume_id in volume_ids:
+            row = _representative_row(dataset.frame, int(volume_id))
+            sample = dataset[int(row.name)]
+            mask = sample.get("mask")
+            if mask is None:
+                continue
+            target_mask = mask.float()
+            if target_mask.ndim == 3:
+                target_mask = target_mask.unsqueeze(0)
+            with torch.no_grad():
+                outputs = randomized(sample["image"].unsqueeze(0).to(device))
+                factual_probs = torch.sigmoid(outputs["seg_logits"][0].cpu())
+            _, disease_entry = _select_counterfactual_references(
+                reference_bank,
+                outputs["z_d"][0].detach().cpu(),
+                outputs["z_c"][0].detach().cpu(),
+                int(volume_id),
+            )
+            if disease_entry is None:
+                continue
+            dis_sample = dataset[int(disease_entry["row_index"])]
+            dis_mask = dis_sample.get("mask")
+            if dis_mask is None:
+                continue
+            dis_target_mask = dis_mask.float()
+            if dis_target_mask.ndim == 3:
+                dis_target_mask = dis_target_mask.unsqueeze(0)
+            with torch.no_grad():
+                dis_outputs = randomized(dis_sample["image"].unsqueeze(0).to(device))
+                dis_cf = randomized.segment_outputs_from_parts(
+                    dis_outputs["z_d"], outputs["z_c"], dis_outputs.get("disease_features")
+                )
+                dis_cf_probs = torch.sigmoid(dis_cf["seg_logits"][0].cpu())
+            m2_rand = disease_swap_effect(
+                factual_probs, dis_cf_probs, target_mask,
+                cf_target_mask=dis_target_mask, threshold=threshold, region_channels=region_channels,
+            )
+            rand_deltas.append(float(m2_rand.get("cf/M2_disease_swap/mean_delta", 0.0)))
+        dse_random = float(np.mean(rand_deltas)) if rand_deltas else 0.0
+        metrics.update(adebayo_sanity_ratio(dse_trained, dse_random))
+        del randomized
+
+    metrics["cf/num_volumes_scored"] = float(len(volume_ids))
+    return metrics
+
+
 def evaluate(
     checkpoint_path: str | Path,
     split: str = "val",
@@ -885,6 +1135,9 @@ def evaluate(
     tune_brats_regions: bool = False,
     region_threshold_sweep: list[float] | None = None,
     output_path: str | Path | None = None,
+    counterfactual_metrics: bool = False,
+    counterfactual_max_volumes: int | None = None,
+    counterfactual_skip_adebayo: bool = False,
 ) -> dict[str, Any]:
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     config = _load_config(checkpoint, config_path)
@@ -1051,6 +1304,23 @@ def evaluate(
             if region_tuning is not None:
                 metrics["qualitative/uses_region_tuning"] = True
 
+    if counterfactual_metrics:
+        cf_metrics = _compute_counterfactual_metrics(
+            model=model,
+            data_config=data_config,
+            split=split,
+            device=device,
+            threshold=qualitative_threshold,
+            max_volumes=counterfactual_max_volumes,
+            run_adebayo=not counterfactual_skip_adebayo,
+        )
+        metrics.update(cf_metrics)
+        if cf_metrics:
+            checkpoint_path_obj = Path(checkpoint_path)
+            cf_output = checkpoint_path_obj.with_name(f"{checkpoint_path_obj.stem}_{split}_counterfactual_metrics.json")
+            save_json(cf_metrics, cf_output)
+            metrics["cf/output_path"] = str(cf_output)
+
     if output_path is None:
         checkpoint_path_obj = Path(checkpoint_path)
         output_path = checkpoint_path_obj.with_name(f"{checkpoint_path_obj.stem}_{split}_metrics.json")
@@ -1084,6 +1354,21 @@ def parse_args() -> argparse.Namespace:
         help="Optional comma-separated thresholds for WT/TC/ET tuning. Defaults to --threshold-sweep.",
     )
     parser.add_argument("--output", help="Optional JSON output path.")
+    parser.add_argument(
+        "--counterfactual-metrics",
+        action="store_true",
+        help="Compute M1/M2/M3/M5 counterfactual metrics (Phase C.2). Runs a second pass over volumes.",
+    )
+    parser.add_argument(
+        "--counterfactual-max-volumes",
+        type=int,
+        help="Optional cap on the number of volumes to use for counterfactual metric scoring.",
+    )
+    parser.add_argument(
+        "--counterfactual-skip-adebayo",
+        action="store_true",
+        help="Skip the M3 Adebayo randomized-encoder rerun (faster, no sanity ratio reported).",
+    )
     return parser.parse_args()
 
 
@@ -1104,6 +1389,9 @@ def main() -> None:
         tune_brats_regions=args.tune_brats_regions,
         region_threshold_sweep=_parse_threshold_sweep(args.region_threshold_sweep),
         output_path=args.output,
+        counterfactual_metrics=args.counterfactual_metrics,
+        counterfactual_max_volumes=args.counterfactual_max_volumes,
+        counterfactual_skip_adebayo=args.counterfactual_skip_adebayo,
     )
     print(metrics)
 

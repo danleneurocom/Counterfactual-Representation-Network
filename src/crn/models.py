@@ -7,6 +7,8 @@ import torch
 from torch import Tensor, nn
 import torch.nn.functional as F
 
+from .mednext_blocks import MedNeXtBlock, MedNeXtDownBlock, mednext_config
+
 
 def _pair(value: int | Sequence[int]) -> tuple[int, int]:
     if isinstance(value, int):
@@ -197,6 +199,98 @@ class VolumetricImageEncoder(nn.Module):
             h = block(h)
             features.append(h)
         return self.proj(self.pool(h)), features
+
+    def forward(self, x: Tensor) -> Tensor:
+        latent, _ = self.forward_features(x)
+        return latent
+
+
+class MedNeXtEncoder(nn.Module):
+    """3D MedNeXt encoder (Roy et al., MICCAI 2023).
+
+    Exposes the same `feature_channels` + `forward_features` contract as
+    `ImageEncoder` and `VolumetricImageEncoder`, so it plugs directly into
+    `CounterfactualRepresentationNetwork` and `VolumetricContextualUNetDecoder`.
+    """
+
+    def __init__(
+        self,
+        in_channels: int,
+        latent_dim: int,
+        variant: str = "L",
+        kernel_size: int = 5,
+        n_channels: int | None = None,
+        norm_type: str | None = None,
+        group_norm_groups: int | None = None,
+    ) -> None:
+        super().__init__()
+        del norm_type, group_norm_groups
+
+        cfg = mednext_config(variant)
+        base_channels = int(n_channels) if n_channels is not None else int(cfg["n_channels"])
+        blocks_per_stage = list(cfg["blocks_per_stage"])
+        exp_ratios = list(cfg["exp_ratios"])
+        if len(blocks_per_stage) != 4 or len(exp_ratios) != 4:
+            raise ValueError("MedNeXt encoder expects 4 encoder stages.")
+
+        channels = [base_channels * (2**i) for i in range(5)]
+        self._feature_channels = channels
+
+        self.stem = nn.Conv3d(in_channels, channels[0], kernel_size=1)
+
+        self.stages = nn.ModuleList()
+        self.downsamplers = nn.ModuleList()
+        for stage_idx in range(4):
+            in_c = channels[stage_idx]
+            out_c = channels[stage_idx + 1]
+            exp = int(exp_ratios[stage_idx])
+            depth = int(blocks_per_stage[stage_idx])
+            stage_blocks = nn.Sequential(
+                *[
+                    MedNeXtBlock(
+                        in_channels=in_c,
+                        out_channels=in_c,
+                        exp_ratio=exp,
+                        kernel_size=kernel_size,
+                        dim=3,
+                    )
+                    for _ in range(depth)
+                ]
+            )
+            self.stages.append(stage_blocks)
+            self.downsamplers.append(
+                MedNeXtDownBlock(
+                    in_channels=in_c,
+                    out_channels=out_c,
+                    exp_ratio=exp,
+                    kernel_size=kernel_size,
+                    dim=3,
+                )
+            )
+
+        self.pool = nn.AdaptiveAvgPool3d(1)
+        self.proj = nn.Sequential(
+            nn.Flatten(),
+            nn.Linear(channels[-1], latent_dim),
+            nn.LayerNorm(latent_dim),
+        )
+
+    @property
+    def feature_channels(self) -> list[int]:
+        return list(self._feature_channels)
+
+    def forward_features(self, x: Tensor) -> tuple[Tensor, list[Tensor]]:
+        features: list[Tensor] = []
+        h = self.stem(x)
+        h = self.stages[0](h)
+        features.append(h)
+        for stage_idx in range(4):
+            h = self.downsamplers[stage_idx](h)
+            if stage_idx + 1 < 4:
+                h = self.stages[stage_idx + 1](h)
+            features.append(h)
+        latent = self.proj(self.pool(h))
+        return latent, features
 
     def forward(self, x: Tensor) -> Tensor:
         latent, _ = self.forward_features(x)
@@ -485,6 +579,9 @@ def _canonical_backbone_mode(backbone_mode: str) -> str:
         "25d": "volumetric",
         "3d": "volumetric",
         "volumetric": "volumetric",
+        "mednext": "mednext",
+        "mednext3d": "mednext",
+        "mednext_3d": "mednext",
     }
     if value not in aliases:
         raise ValueError(f"Unsupported backbone_mode: {backbone_mode!r}")
@@ -508,6 +605,8 @@ class CounterfactualRepresentationNetwork(nn.Module):
         backbone_mode: str = "2d",
         norm_type: str = "batch",
         group_norm_groups: int = 8,
+        mednext_variant: str = "L",
+        mednext_kernel_size: int = 5,
     ) -> None:
         super().__init__()
         self.latent_dim = latent_dim
@@ -516,25 +615,29 @@ class CounterfactualRepresentationNetwork(nn.Module):
         self.num_seg_classes = num_seg_classes
         self.segmentation_head = segmentation_head
         self.backbone_mode = _canonical_backbone_mode(backbone_mode)
-        self.is_volumetric_backbone = self.backbone_mode == "volumetric"
+        self.is_volumetric_backbone = self.backbone_mode in ("volumetric", "mednext")
+        self.is_mednext_backbone = self.backbone_mode == "mednext"
 
-        encoder_cls: type[ImageEncoder] | type[VolumetricImageEncoder]
-        encoder_cls = VolumetricImageEncoder if self.is_volumetric_backbone else ImageEncoder
+        def _make_encoder() -> nn.Module:
+            if self.is_mednext_backbone:
+                return MedNeXtEncoder(
+                    in_channels=in_channels,
+                    latent_dim=latent_dim,
+                    variant=mednext_variant,
+                    kernel_size=mednext_kernel_size,
+                    n_channels=base_channels,
+                )
+            encoder_cls = VolumetricImageEncoder if self.is_volumetric_backbone else ImageEncoder
+            return encoder_cls(
+                in_channels,
+                latent_dim,
+                base_channels,
+                norm_type=norm_type,
+                group_norm_groups=group_norm_groups,
+            )
 
-        self.disease_encoder = encoder_cls(
-            in_channels,
-            latent_dim,
-            base_channels,
-            norm_type=norm_type,
-            group_norm_groups=group_norm_groups,
-        )
-        self.context_encoder = encoder_cls(
-            in_channels,
-            latent_dim,
-            base_channels,
-            norm_type=norm_type,
-            group_norm_groups=group_norm_groups,
-        )
+        self.disease_encoder = _make_encoder()
+        self.context_encoder = _make_encoder()
         init_volume_context_weight = float(min(max(init_volume_context_weight, 1e-4), 1.0 - 1e-4))
         self.volume_context_logit = nn.Parameter(
             torch.tensor(math.log(init_volume_context_weight / (1.0 - init_volume_context_weight)), dtype=torch.float32)

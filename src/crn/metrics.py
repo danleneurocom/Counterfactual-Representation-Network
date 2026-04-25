@@ -356,3 +356,247 @@ def summarize_metrics(items: list[dict[str, Any]]) -> dict[str, float]:
         values = [float(item[key]) for item in items]
         summary[key] = float(np.mean(values))
     return summary
+
+
+# ---------------------------------------------------------------------------
+# Counterfactual metrics (M1 / M2 / M3 / M5) — Phase C.1
+#
+# These operate on probability volumes with the same [depth, channels, H, W]
+# layout used by `brats_volume_metrics_from_probs`. Default BraTS region map
+# is WT = [0, 1, 2], TC = [0, 2], ET = [2].
+# ---------------------------------------------------------------------------
+
+
+_DEFAULT_BRATS_REGIONS: dict[str, list[int]] = {"WT": [0, 1, 2], "TC": [0, 2], "ET": [2]}
+
+
+def _binary_dice(pred: Tensor, target: Tensor, eps: float = 1e-6) -> float:
+    pred = pred.float()
+    target = target.float()
+    intersection = float((pred * target).sum().item())
+    denom = float(pred.sum().item() + target.sum().item())
+    return (2.0 * intersection + eps) / (denom + eps)
+
+
+def _region_mask(probs: Tensor, channels: list[int], threshold: float) -> Tensor:
+    return (probs[:, channels].amax(dim=1) >= threshold).float()
+
+
+def context_invariance_dice(
+    factual_probs: Tensor,
+    context_cf_probs: Tensor,
+    threshold: float = 0.5,
+    region_channels: dict[str, list[int]] | None = None,
+    eps: float = 1e-6,
+) -> dict[str, float]:
+    """M1 — Context invariance (Monteiro 2023 composition / Jeanneret 2023 MNAC).
+
+    Dice between factual and context-swapped counterfactual segmentation.
+    1.0 ⇒ the model is insensitive to context perturbation on the final mask.
+    """
+    regions = region_channels or _DEFAULT_BRATS_REGIONS
+    metrics: dict[str, float] = {}
+    vals: list[float] = []
+    for name, channels in regions.items():
+        f_mask = _region_mask(factual_probs, channels, threshold)
+        cf_mask = _region_mask(context_cf_probs, channels, threshold)
+        dice = _binary_dice(f_mask, cf_mask, eps)
+        metrics[f"cf/M1_context_invariance/{name}/dice"] = dice
+        vals.append(dice)
+    metrics["cf/M1_context_invariance/mean_dice"] = float(np.mean(vals)) if vals else float("nan")
+    return metrics
+
+
+def disease_swap_effect(
+    factual_probs: Tensor,
+    disease_cf_probs: Tensor,
+    target_mask: Tensor,
+    cf_target_mask: Tensor | None = None,
+    threshold: float = 0.5,
+    region_channels: dict[str, list[int]] | None = None,
+    eps: float = 1e-6,
+) -> dict[str, float]:
+    """M2 — Disease-swap effect (Reinhold 2021; Mehta 2025 CF-Seg).
+
+    Δ = Dice(disease-CF seg vs CF target) − Dice(factual seg vs factual target).
+    Positive Δ ⇒ swapping the disease latent shifts the predicted lesion toward
+    the counterfactual target (causal responsiveness). If `cf_target_mask` is
+    None we fall back to `target_mask` for both terms (in-distribution probe).
+    """
+    regions = region_channels or _DEFAULT_BRATS_REGIONS
+    cf_target = cf_target_mask if cf_target_mask is not None else target_mask
+    metrics: dict[str, float] = {}
+    deltas: list[float] = []
+    for name, channels in regions.items():
+        factual_pred = _region_mask(factual_probs, channels, threshold)
+        cf_pred = _region_mask(disease_cf_probs, channels, threshold)
+        factual_target = (target_mask[:, channels].amax(dim=1) >= 0.5).float()
+        cf_target_region = (cf_target[:, channels].amax(dim=1) >= 0.5).float()
+        d_factual = _binary_dice(factual_pred, factual_target, eps)
+        d_cf = _binary_dice(cf_pred, cf_target_region, eps)
+        delta = d_cf - d_factual
+        metrics[f"cf/M2_disease_swap/{name}/dice_factual"] = d_factual
+        metrics[f"cf/M2_disease_swap/{name}/dice_cf"] = d_cf
+        metrics[f"cf/M2_disease_swap/{name}/delta"] = delta
+        deltas.append(delta)
+    metrics["cf/M2_disease_swap/mean_delta"] = float(np.mean(deltas)) if deltas else float("nan")
+    return metrics
+
+
+def adebayo_sanity_ratio(
+    dse_trained: float,
+    dse_randomized: float,
+    eps: float = 1e-6,
+) -> dict[str, float]:
+    """M3 — Adebayo sanity (arXiv:1810.03292).
+
+    r = |DSE(trained) − DSE(randomized)| / (|DSE(trained)| + eps).
+    1.0 ⇒ the trained disease encoder is required for the observed DSE effect.
+    Near 0 ⇒ a randomly-initialized encoder produces the same effect (failure).
+    """
+    trained = float(dse_trained)
+    randomized = float(dse_randomized)
+    ratio = abs(trained - randomized) / (abs(trained) + eps)
+    return {
+        "cf/M3_adebayo/dse_trained": trained,
+        "cf/M3_adebayo/dse_randomized": randomized,
+        "cf/M3_adebayo/ratio": float(ratio),
+    }
+
+
+def _l1_similarity(a: Tensor, b: Tensor) -> float:
+    a = a.float()
+    b = b.float()
+    denom = float(a.abs().sum().item() + b.abs().sum().item()) + 1e-6
+    diff = float((a - b).abs().sum().item())
+    return 1.0 - (diff / denom)
+
+
+def axiomatic_soundness(
+    factual_probs: Tensor,
+    null_intervention_probs: Tensor,
+    roundtrip_probs: Tensor,
+    cf_images: Tensor | None = None,
+    cf_classifier_logits: Tensor | None = None,
+    cf_target_labels: Tensor | None = None,
+    threshold: float = 0.5,
+    region_channels: dict[str, list[int]] | None = None,
+    eps: float = 1e-6,
+) -> dict[str, float]:
+    """M5 — Axiomatic soundness (Monteiro 2023, arXiv:2303.01274).
+
+    * Composition   : f(z_d, z_c) applied with a null intervention ≈ factual.
+                      Measured as 1 − normalized-L1 distance between probs.
+    * Reversibility : Dice(factual mask, (z_d → z_d' → z_d roundtrip) mask).
+    * Effectiveness : P(φ(x_CF) = y_{d'}) under a disease classifier φ.
+                      Optional — only computed when classifier logits + labels
+                      for the counterfactual targets are supplied.
+    """
+    regions = region_channels or _DEFAULT_BRATS_REGIONS
+    metrics: dict[str, float] = {}
+
+    metrics["cf/M5_composition"] = float(_l1_similarity(factual_probs, null_intervention_probs))
+
+    reversibility_vals: list[float] = []
+    for name, channels in regions.items():
+        f_mask = _region_mask(factual_probs, channels, threshold)
+        r_mask = _region_mask(roundtrip_probs, channels, threshold)
+        dice = _binary_dice(f_mask, r_mask, eps)
+        metrics[f"cf/M5_reversibility/{name}/dice"] = dice
+        reversibility_vals.append(dice)
+    metrics["cf/M5_reversibility/mean_dice"] = (
+        float(np.mean(reversibility_vals)) if reversibility_vals else float("nan")
+    )
+
+    if cf_classifier_logits is not None and cf_target_labels is not None:
+        logits = cf_classifier_logits.detach().float()
+        labels = cf_target_labels.detach().float()
+        if logits.ndim == 1:
+            logits = logits.unsqueeze(1)
+        if labels.ndim == 1:
+            labels = labels.unsqueeze(1)
+        probs = torch.sigmoid(logits)
+        preds = (probs >= 0.5).float()
+        agree = (preds == (labels >= 0.5).float()).float()
+        metrics["cf/M5_effectiveness"] = float(agree.mean().item())
+    else:
+        metrics["cf/M5_effectiveness"] = float("nan")
+
+    del cf_images  # reserved for future LPIPS-style composition scoring
+    return metrics
+
+
+# ---------------------------------------------------------------------------
+# OOD robustness helpers (Phase C.3 – C.5)
+# ---------------------------------------------------------------------------
+
+
+def mean_corruption_error(
+    source_region_dice: dict[str, float],
+    corrupted_region_dice: dict[tuple[str, int], dict[str, float]],
+    baseline_corrupted_region_dice: dict[tuple[str, int], dict[str, float]] | None = None,
+    eps: float = 1e-6,
+) -> dict[str, float]:
+    """ROOD-MRI / Hendrycks-style mean Corruption Error.
+
+    `corrupted_region_dice[(transform, severity)]` is a region-wise Dice dict
+    (e.g. {"WT": 0.87, "TC": 0.77, "ET": 0.75}). We report per-transform and
+    aggregate mCE as mean(1 − Dice_corrupted) / mean(1 − Dice_source), with an
+    optional baseline normalization (model mCE / baseline mCE).
+    """
+    region_names = list(source_region_dice.keys())
+    src_err = {r: max(1.0 - float(source_region_dice[r]), 0.0) for r in region_names}
+
+    per_transform: dict[str, list[float]] = {}
+    for (transform, _severity), region_scores in corrupted_region_dice.items():
+        vals = [max(1.0 - float(region_scores.get(r, 0.0)), 0.0) for r in region_names]
+        per_transform.setdefault(transform, []).extend(vals)
+
+    metrics: dict[str, float] = {}
+    ce_values: list[float] = []
+    for transform, errs in per_transform.items():
+        ce = float(np.mean(errs)) / (float(np.mean(list(src_err.values()))) + eps)
+        metrics[f"ood/mCE/{transform}"] = ce
+        ce_values.append(ce)
+    metrics["ood/mCE/mean"] = float(np.mean(ce_values)) if ce_values else float("nan")
+
+    if baseline_corrupted_region_dice is not None:
+        base_per_transform: dict[str, list[float]] = {}
+        for (transform, _severity), region_scores in baseline_corrupted_region_dice.items():
+            vals = [max(1.0 - float(region_scores.get(r, 0.0)), 0.0) for r in region_names]
+            base_per_transform.setdefault(transform, []).extend(vals)
+        for transform, errs in per_transform.items():
+            base = base_per_transform.get(transform)
+            if not base:
+                continue
+            ratio = float(np.mean(errs)) / (float(np.mean(base)) + eps)
+            metrics[f"ood/mCE_rel_baseline/{transform}"] = ratio
+    return metrics
+
+
+def site_level_summary(
+    per_site_region_dice: dict[str, dict[str, float]],
+) -> dict[str, float]:
+    """FeTS leave-one-institution-out aggregation.
+
+    `per_site_region_dice[site_id][region]` → Dice. Reports mean, worst-case,
+    and inter-site std per region — the clinically meaningful robustness
+    signature emphasized in Pati et al. 2022.
+    """
+    if not per_site_region_dice:
+        return {}
+    region_names = sorted({r for scores in per_site_region_dice.values() for r in scores})
+    metrics: dict[str, float] = {}
+    all_mean = []
+    for region in region_names:
+        values = [float(per_site_region_dice[s].get(region, float("nan"))) for s in per_site_region_dice]
+        finite = [v for v in values if not np.isnan(v)]
+        if not finite:
+            continue
+        metrics[f"ood/fets/{region}/mean_dice"] = float(np.mean(finite))
+        metrics[f"ood/fets/{region}/worst_case_dice"] = float(np.min(finite))
+        metrics[f"ood/fets/{region}/inter_site_std"] = float(np.std(finite))
+        all_mean.append(float(np.mean(finite)))
+    if all_mean:
+        metrics["ood/fets/mean_dice"] = float(np.mean(all_mean))
+    return metrics

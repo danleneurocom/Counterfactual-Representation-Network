@@ -1,8 +1,8 @@
 # Counterfactual Representation Network
 
-Research scaffold for **Counterfactual Representation Network for Fair and Interpretable Imaging**.
+Research scaffold for **Counterfactual Representation Network for Fair and Interpretable Imaging**, targeting ICDM 2026.
 
-The initial draft treated context/confounders as factors to remove from prediction. The corrected framing here follows the supervisor feedback: confounders can also be causal parents of the label, so prediction should condition on both latent components while estimating the intervention effect of the disease factor.
+The initial draft treated context/confounders as factors to remove from prediction. The corrected framing here follows the supervisor feedback and the identifiability / proximal-inference literature: confounders can also be causal parents of the label, so prediction should condition on both latent components while estimating the intervention effect of the disease factor — and the identifiability of that factorization requires paired/counterfactual supervision, not unsupervised disentanglement (Locatello et al. 2019).
 
 Core model:
 
@@ -14,13 +14,13 @@ m_hat = f_seg(z_d, z_c)
 x_hat = G(z_d, z_c)
 ```
 
-Core training idea:
+Core training idea (latent bank backdoor adjustment, reframed as proximal causal inference):
 
 ```text
-p(y | do(z_d)) ~= E_{z_c}[p(y | z_d, z_c)]
+p(m | do(z_d)) ~= (1/K) sum_k p(m | z_d, z_c^(k))
 ```
 
-In practice, `crn.losses.backdoor_adjusted_logits` averages predictions over context latents from the minibatch. Context swapping is used as a bounded stability regularizer, not a strict invariance constraint.
+`crn.losses.backdoor_adjusted_seg_logits` averages segmentation predictions over a context bank, which plays the role of a proxy for the true unobserved context `U` in the sense of Miao–Geng–Tchetgen Tchetgen (2018) and Tchetgen Tchetgen et al. (2024). The estimator is valid under assumptions (A1)–(A5) spelled out in `docs/causal_counterfactual_framework_note.md` §4.1 (proxy structure, completeness, bridge existence, positivity, representative bank). `z_d` and `z_c` are identified *up to block-wise affine transformation* via auxiliary-variable (iVAE), content/style, and paired-intervention identifiability results. Context swapping is used as a bounded stability regularizer, not a strict invariance constraint.
 
 ## Project Layout
 
@@ -97,18 +97,18 @@ Outputs are written to the config's `training.output_dir`.
 For the current strongest BraTS segmentation recipe, use:
 
 ```bash
-PYTHONPATH=src python -m crn.train --config configs/crn_brats_segonly_unet_causal_contrastive_continue.yaml
-```
-
-This is the current best continued contrastive causal-region setup. If you want the stronger non-contrastive baseline instead, use `configs/crn_brats_segonly_unet_causal.yaml`. The `*_memory*.yaml` configs remain available for counterfactual-memory experiments, but they are experimental and have not beaten the current best model.
-
-To move the same causal mechanism onto a stronger depth-aware backbone, use the new 2.5D causal config:
-
-```bash
 PYTHONPATH=src python -m crn.train --config configs/crn_brats_segonly_unet_causal_contrastive_25d.yaml
 ```
 
-This keeps `region_adjustment`, `region_disease_swap`, and lesion-aware contrastive learning, but replaces the planar backbone with a depth-aware slice-stack encoder/decoder. For a quick real-data sanity check before the full run, use `configs/crn_brats_segonly_unet_causal_contrastive_25d_pilot.yaml`.
+This is the current best depth-aware causal-contrastive setup. It keeps `region_adjustment`, `region_disease_swap`, and lesion-aware contrastive learning, but replaces the planar backbone with a 2.5D slice-stack encoder/decoder. For a quick real-data sanity check before the full run, use `configs/crn_brats_segonly_unet_causal_contrastive_25d_pilot.yaml`.
+
+The previous best 2D causal-contrastive recipe is still available:
+
+```bash
+PYTHONPATH=src python -m crn.train --config configs/crn_brats_segonly_unet_causal_contrastive_continue.yaml
+```
+
+If you want the stronger non-contrastive baseline instead, use `configs/crn_brats_segonly_unet_causal.yaml`. The `*_memory*.yaml` configs remain available for counterfactual-memory experiments, but they are experimental and have not beaten the current best model.
 
 To try the lesion-aware counterfactual contrastive upgrade on top of the strong causal-region checkpoint, use:
 
@@ -146,26 +146,26 @@ PYTHONPATH=src python -m crn.train --config configs/crn_brats_smoke.yaml
 To evaluate a saved checkpoint:
 
 ```bash
-PYTHONPATH=src python -m crn.evaluate --checkpoint runs/brats_segonly_unet_causal_contrastive_continue/best.pt --split val --batch-size 8
+PYTHONPATH=src python -m crn.evaluate --checkpoint runs/brats_segonly_unet_causal_contrastive_25d/best.pt --split val --batch-size 2
 ```
 
-This writes a metrics JSON next to the checkpoint, for example `runs/brats_segonly_unet_causal_contrastive_continue/best_val_metrics.json`.
+This writes a metrics JSON next to the checkpoint, for example `runs/brats_segonly_unet_causal_contrastive_25d/best_val_metrics.json`.
 
 To run volume-level evaluation with a threshold sweep and export qualitative figures:
 
 ```bash
 PYTHONPATH=src python -m crn.evaluate \
-  --checkpoint runs/brats_segonly_unet_causal_contrastive_continue/best.pt \
+  --checkpoint runs/brats_segonly_unet_causal_contrastive_25d/best.pt \
   --split val \
-  --batch-size 8 \
+  --batch-size 2 \
   --threshold-sweep 0.35,0.40,0.45,0.50,0.55,0.60,0.65 \
   --qualitative-count 4
 ```
 
 This additionally writes:
 
-- `runs/brats_segonly_unet_causal_contrastive_continue/best_val_threshold_sweep.json`
-- `runs/brats_segonly_unet_causal_contrastive_continue/best_val_qualitative/`
+- `runs/brats_segonly_unet_causal_contrastive_25d/best_val_threshold_sweep.json`
+- `runs/brats_segonly_unet_causal_contrastive_25d/best_val_qualitative/`
 
 The qualitative export saves representative best and worst validation volumes as PNG overlays together with a `summary.json` index.
 It now also exports causal counterfactual image panels for representative volumes:
@@ -182,15 +182,15 @@ To independently tune `WT`, `TC`, and `ET` thresholds with simple 3D post-proces
 
 ```bash
 PYTHONPATH=src python -m crn.evaluate \
-  --checkpoint runs/brats_segonly_unet_causal_contrastive_continue/best.pt \
+  --checkpoint runs/brats_segonly_unet_causal_contrastive_25d/best.pt \
   --split val \
-  --batch-size 8 \
+  --batch-size 2 \
   --threshold-sweep 0.35,0.40,0.45,0.50,0.55,0.60,0.65 \
   --tune-brats-regions \
   --qualitative-count 4
 ```
 
-This also writes `runs/brats_segonly_unet_causal_contrastive_continue/best_val_region_tuning.json` with the selected region-wise thresholds and cleanup settings.
+This also writes `runs/brats_segonly_unet_causal_contrastive_25d/best_val_region_tuning.json` with the selected region-wise thresholds and cleanup settings.
 
 The current BraTS configs are now set up for 3-channel subregion segmentation with BraTS region metrics:
 
