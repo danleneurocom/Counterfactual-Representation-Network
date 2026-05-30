@@ -55,13 +55,19 @@ def _array_to_tensor(array: np.ndarray, channels: int | None = None, normalizati
         pass
     elif array.ndim == 3:
         array = np.moveaxis(array, -1, 0)
+    elif array.ndim == 4:
+        pass  # volume: (C, D, H, W)
     else:
-        raise ValueError(f"Expected 2D or 3D image array, got shape {array.shape}")
+        raise ValueError(f"Expected 2D, 3D or 4D image array, got shape {array.shape}")
 
     tensor = torch.from_numpy(np.ascontiguousarray(array)).float()
     if channels is not None and tensor.shape[0] != channels:
         if tensor.shape[0] == 1 and channels > 1:
-            tensor = tensor.expand(channels, -1, -1)
+            # For 3D volumes, expand only spatial dims, keep depth
+            if tensor.ndim == 4:
+                tensor = tensor.expand(channels, -1, -1, -1)
+            else:
+                tensor = tensor.expand(channels, -1, -1)
         else:
             raise ValueError(f"Expected {channels} channels, got {tensor.shape[0]}")
     return tensor.clamp(0.0, 1.0)
@@ -70,8 +76,13 @@ def _array_to_tensor(array: np.ndarray, channels: int | None = None, normalizati
 def _resize_tensor(tensor: Tensor, image_size: tuple[int, int], is_mask: bool) -> Tensor:
     if tensor.shape[-2:] == image_size:
         return tensor
+    if tensor.ndim == 4:
+        mode = "nearest" if is_mask else "trilinear"
+        kwargs: dict[str, Any] = {} if is_mask else {"align_corners": False}
+        target_size = (tensor.shape[-3], *image_size)
+        return F.interpolate(tensor.unsqueeze(0), size=target_size, mode=mode, **kwargs).squeeze(0)
     mode = "nearest" if is_mask else "bilinear"
-    kwargs: dict[str, Any] = {} if is_mask else {"align_corners": False}
+    kwargs = {} if is_mask else {"align_corners": False}
     return F.interpolate(tensor.unsqueeze(0), size=image_size, mode=mode, **kwargs).squeeze(0)
 
 
@@ -214,13 +225,34 @@ class ImagingCsvDataset(Dataset):
             image_path = _resolve_path(self.image_root, row[self.image_col])
             image = self._load_image(image_path)
             if self.slice_context_layout == "depth":
-                return image.unsqueeze(1)
+                if image.ndim == 3:
+                    return image.unsqueeze(1)
+                # image is already a 4D volume (C, D, H, W)
+                return image
             return image
 
         half_window = self.slice_context // 2
         volume_id = int(row["volume"])
         center_slice = int(row["slice"])
         min_slice, max_slice = self._volume_slice_bounds[volume_id]
+
+        # Check if data is stored as per-volume files (4D arrays in one file)
+        first_path = _resolve_path(self.image_root, row[self.image_col])
+        first_slice = self._load_image(first_path)
+        if first_slice.ndim == 4:
+            # Extract window directly from the volume
+            start = max(center_slice - half_window, min_slice)
+            end = min(center_slice + half_window, max_slice) + 1
+            extracted: list[Tensor] = [first_slice[:, s] for s in range(start, end)]
+            while len(extracted) < self.slice_context:
+                if center_slice - min_slice < max_slice - center_slice:
+                    extracted.insert(0, extracted[0])
+                else:
+                    extracted.append(extracted[-1])
+            if self.slice_context_layout == "depth":
+                return torch.stack(extracted, dim=1)
+            return torch.cat(extracted, dim=0)
+
         slices: list[Tensor] = []
         for delta in range(-half_window, half_window + 1):
             slice_id = min(max(center_slice + delta, min_slice), max_slice)
@@ -235,8 +267,14 @@ class ImagingCsvDataset(Dataset):
     def __getitem__(self, index: int) -> dict[str, Any]:
         row = self.frame.iloc[index]
         image_path = _resolve_path(self.image_root, row[self.image_col])
+        image = self._context_image(row)
+        # If the loaded data is a full volume (C, D, H, W) and we only want one slice, extract it
+        if self.slice_context == 1 and image.ndim == 4 and "slice" in row.index:
+            image = image[:, int(row["slice"])]
+            if self.slice_context_layout == "depth":
+                image = image.unsqueeze(1)
         item: dict[str, Any] = {
-            "image": self._context_image(row),
+            "image": image,
             "index": int(index),
             "path": str(image_path),
         }
@@ -247,7 +285,10 @@ class ImagingCsvDataset(Dataset):
             item["label"] = self._labels(row)
         if self.mask_col:
             mask_path = _resolve_path(self.image_root, row[self.mask_col])
-            item["mask"] = self._load_image(mask_path, is_mask=True)
+            mask = self._load_image(mask_path, is_mask=True)
+            if mask.ndim == 4 and "slice" in row.index:
+                mask = mask[:, int(row["slice"])]
+            item["mask"] = mask
         return item
 
 

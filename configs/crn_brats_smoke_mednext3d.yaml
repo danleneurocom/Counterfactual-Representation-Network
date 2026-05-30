@@ -1,8 +1,8 @@
 seed: 7
 
 data:
-  train_csv: data/smoke/brats_train.csv
-  val_csv: data/smoke/brats_val.csv
+  train_csv: data/smoke3d/brats_train.csv
+  val_csv: data/smoke3d/brats_val.csv
   image_root: data/smoke/brats
   image_col: path
   mask_col: mask
@@ -22,15 +22,23 @@ data:
   image_normalization: minmax
   image_size: [32, 32]
   in_channels: 4
+  slice_context: 3
+  slice_context_layout: depth
   uncertain_value: 0.0
   missing_label_value: 0.0
 
 model:
   latent_dim: 16
-  base_channels: 8
+  base_channels: 16
   num_classes: 1
   num_seg_classes: 3
   head_uses_context: true
+  segmentation_head: unet
+  backbone_mode: mednext
+  mednext_variant: S
+  mednext_kernel_size: 5
+  norm_type: group
+  group_norm_groups: 8
 
 loss:
   lambda_cls: 0.25
@@ -45,12 +53,11 @@ loss:
   adjustment_contexts: 2
 
 training:
-  batch_size: 2
+  batch_size: 1
   epochs: 1
   max_train_batches: 2
-  max_val_batches: 1
   lr: 0.0002
   weight_decay: 0.0001
   num_workers: 0
-  output_dir: runs/brats_smoke_multiregion
+  output_dir: runs/brats_smoke_mednext3d
   device: auto

@@ -1,0 +1,293 @@
+Terminal activity log
+============================= test session starts ==============================
+platform linux -- Python 3.12.3, pytest-9.0.3, pluggy-1.6.0
+rootdir: /workspace/Counterfactual-Representation-Network
+configfile: pyproject.toml
+plugins: anyio-4.13.0
+collected 0 items / 1 error
+
+==================================== ERRORS ====================================
+_____________________ ERROR collecting tests/test_train.py _____________________
+ImportError while importing test module '/workspace/Counterfactual-Representation-Network/tests/test_train.py'.
+Hint: make sure your test modules/packages have valid Python names.
+Traceback:
+/usr/lib/python3.12/importlib/__init__.py:90: in import_module
+    return _bootstrap._gcd_import(name[level:], package, level)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+tests/test_train.py:1: in <module>
+    from crn.train import _effective_loss_config, _should_update_best, build_model
+src/crn/__init__.py:3: in <module>
+    from crn.models import CounterfactualRepresentationNetwork
+src/crn/models.py:6: in <module>
+    import torch
+E   ModuleNotFoundError: No module named 'torch'
+=========================== short test summary info ============================
+ERROR tests/test_train.py
+!!!!!!!!!!!!!!!!!!!! Interrupted: 1 error during collection !!!!!!!!!!!!!!!!!!!!
+=============================== 1 error in 0.13s ===============================
+Obtaining file:///workspace/Counterfactual-Representation-Network
+  Installing build dependencies: started
+  Installing build dependencies: finished with status 'done'
+  Checking if build backend supports build_editable: started
+  Checking if build backend supports build_editable: finished with status 'done'
+  Getting requirements to build editable: started
+  Getting requirements to build editable: finished with status 'done'
+  Preparing editable metadata (pyproject.toml): started
+  Preparing editable metadata (pyproject.toml): finished with status 'done'
+Requirement already satisfied: numpy>=1.24 in /venv/main/lib/python3.12/site-packages (from counterfactual-representation-network==0.1.0) (2.4.3)
+Collecting pandas>=2.0 (from counterfactual-representation-network==0.1.0)
+  Downloading pandas-3.0.3-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl.metadata (79 kB)
+Requirement already satisfied: pillow>=10.0 in /venv/main/lib/python3.12/site-packages (from counterfactual-representation-network==0.1.0) (12.1.1)
+Requirement already satisfied: pyyaml>=6.0 in /venv/main/lib/python3.12/site-packages (from counterfactual-representation-network==0.1.0) (6.0.3)
+Collecting scipy>=1.11 (from counterfactual-representation-network==0.1.0)
+  Downloading scipy-1.17.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl.metadata (62 kB)
+Collecting scikit-learn>=1.3 (from counterfactual-representation-network==0.1.0)
+  Downloading scikit_learn-1.8.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl.metadata (11 kB)
+Collecting wandb>=0.17 (from counterfactual-representation-network==0.1.0)
+  Downloading wandb-0.27.0-py3-none-manylinux_2_28_x86_64.whl.metadata (11 kB)
+Requirement already satisfied: torch>=2.2 in /venv/main/lib/python3.12/site-packages (from counterfactual-representation-network==0.1.0) (2.11.0+cu130)
+Requirement already satisfied: tqdm>=4.66 in /venv/main/lib/python3.12/site-packages (from counterfactual-representation-network==0.1.0) (4.67.3)
+Collecting h5py>=3.10 (from counterfactual-representation-network==0.1.0)
+  Downloading h5py-3.16.0-cp312-cp312-manylinux_2_28_x86_64.whl.metadata (3.0 kB)
+Collecting pytest>=8.0 (from counterfactual-representation-network==0.1.0)
+  Using cached pytest-9.0.3-py3-none-any.whl.metadata (7.6 kB)
+Requirement already satisfied: python-dateutil>=2.8.2 in /venv/main/lib/python3.12/site-packages (from pandas>=2.0->counterfactual-representation-network==0.1.0) (2.9.0.post0)
+Collecting iniconfig>=1.0.1 (from pytest>=8.0->counterfactual-representation-network==0.1.0)
+  Using cached iniconfig-2.3.0-py3-none-any.whl.metadata (2.5 kB)
+Requirement already satisfied: packaging>=22 in /venv/main/lib/python3.12/site-packages (from pytest>=8.0->counterfactual-representation-network==0.1.0) (26.0)
+Collecting pluggy<2,>=1.5 (from pytest>=8.0->counterfactual-representation-network==0.1.0)
+  Using cached pluggy-1.6.0-py3-none-any.whl.metadata (4.8 kB)
+Requirement already satisfied: pygments>=2.7.2 in /venv/main/lib/python3.12/site-packages (from pytest>=8.0->counterfactual-representation-network==0.1.0) (2.19.2)
+Requirement already satisfied: six>=1.5 in /venv/main/lib/python3.12/site-packages (from python-dateutil>=2.8.2->pandas>=2.0->counterfactual-representation-network==0.1.0) (1.17.0)
+Collecting joblib>=1.3.0 (from scikit-learn>=1.3->counterfactual-representation-network==0.1.0)
+  Downloading joblib-1.5.3-py3-none-any.whl.metadata (5.5 kB)
+Collecting threadpoolctl>=3.2.0 (from scikit-learn>=1.3->counterfactual-representation-network==0.1.0)
+  Downloading threadpoolctl-3.6.0-py3-none-any.whl.metadata (13 kB)
+Requirement already satisfied: filelock in /venv/main/lib/python3.12/site-packages (from torch>=2.2->counterfactual-representation-network==0.1.0) (3.25.2)
+Requirement already satisfied: typing-extensions>=4.10.0 in /venv/main/lib/python3.12/site-packages (from torch>=2.2->counterfactual-representation-network==0.1.0) (4.15.0)
+Collecting setuptools<82 (from torch>=2.2->counterfactual-representation-network==0.1.0)
+  Downloading setuptools-81.0.0-py3-none-any.whl.metadata (6.6 kB)
+Requirement already satisfied: sympy>=1.13.3 in /venv/main/lib/python3.12/site-packages (from torch>=2.2->counterfactual-representation-network==0.1.0) (1.14.0)
+Requirement already satisfied: networkx>=2.5.1 in /venv/main/lib/python3.12/site-packages (from torch>=2.2->counterfactual-representation-network==0.1.0) (3.6.1)
+Requirement already satisfied: jinja2 in /venv/main/lib/python3.12/site-packages (from torch>=2.2->counterfactual-representation-network==0.1.0) (3.1.6)
+Requirement already satisfied: fsspec>=0.8.5 in /venv/main/lib/python3.12/site-packages (from torch>=2.2->counterfactual-representation-network==0.1.0) (2026.2.0)
+Requirement already satisfied: cuda-toolkit==13.0.2 in /venv/main/lib/python3.12/site-packages (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==13.0.2; platform_system == "Linux"->torch>=2.2->counterfactual-representation-network==0.1.0) (13.0.2)
+Requirement already satisfied: cuda-bindings<14,>=13.0.3 in /venv/main/lib/python3.12/site-packages (from torch>=2.2->counterfactual-representation-network==0.1.0) (13.2.0)
+Requirement already satisfied: nvidia-cudnn-cu13==9.19.0.56 in /venv/main/lib/python3.12/site-packages (from torch>=2.2->counterfactual-representation-network==0.1.0) (9.19.0.56)
+Requirement already satisfied: nvidia-cusparselt-cu13==0.8.0 in /venv/main/lib/python3.12/site-packages (from torch>=2.2->counterfactual-representation-network==0.1.0) (0.8.0)
+Requirement already satisfied: nvidia-nccl-cu13==2.28.9 in /venv/main/lib/python3.12/site-packages (from torch>=2.2->counterfactual-representation-network==0.1.0) (2.28.9)
+Requirement already satisfied: nvidia-nvshmem-cu13==3.4.5 in /venv/main/lib/python3.12/site-packages (from torch>=2.2->counterfactual-representation-network==0.1.0) (3.4.5)
+Requirement already satisfied: triton==3.6.0 in /venv/main/lib/python3.12/site-packages (from torch>=2.2->counterfactual-representation-network==0.1.0) (3.6.0)
+Requirement already satisfied: nvidia-cublas==13.1.0.3.* in /venv/main/lib/python3.12/site-packages (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==13.0.2; platform_system == "Linux"->torch>=2.2->counterfactual-representation-network==0.1.0) (13.1.0.3)
+Requirement already satisfied: nvidia-cuda-runtime==13.0.96.* in /venv/main/lib/python3.12/site-packages (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==13.0.2; platform_system == "Linux"->torch>=2.2->counterfactual-representation-network==0.1.0) (13.0.96)
+Requirement already satisfied: nvidia-cufft==12.0.0.61.* in /venv/main/lib/python3.12/site-packages (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==13.0.2; platform_system == "Linux"->torch>=2.2->counterfactual-representation-network==0.1.0) (12.0.0.61)
+Requirement already satisfied: nvidia-cufile==1.15.1.6.* in /venv/main/lib/python3.12/site-packages (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==13.0.2; platform_system == "Linux"->torch>=2.2->counterfactual-representation-network==0.1.0) (1.15.1.6)
+Requirement already satisfied: nvidia-cuda-cupti==13.0.85.* in /venv/main/lib/python3.12/site-packages (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==13.0.2; platform_system == "Linux"->torch>=2.2->counterfactual-representation-network==0.1.0) (13.0.85)
+Requirement already satisfied: nvidia-curand==10.4.0.35.* in /venv/main/lib/python3.12/site-packages (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==13.0.2; platform_system == "Linux"->torch>=2.2->counterfactual-representation-network==0.1.0) (10.4.0.35)
+Requirement already satisfied: nvidia-cusolver==12.0.4.66.* in /venv/main/lib/python3.12/site-packages (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==13.0.2; platform_system == "Linux"->torch>=2.2->counterfactual-representation-network==0.1.0) (12.0.4.66)
+Requirement already satisfied: nvidia-cusparse==12.6.3.3.* in /venv/main/lib/python3.12/site-packages (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==13.0.2; platform_system == "Linux"->torch>=2.2->counterfactual-representation-network==0.1.0) (12.6.3.3)
+Requirement already satisfied: nvidia-nvjitlink==13.0.88.* in /venv/main/lib/python3.12/site-packages (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==13.0.2; platform_system == "Linux"->torch>=2.2->counterfactual-representation-network==0.1.0) (13.0.88)
+Requirement already satisfied: nvidia-cuda-nvrtc==13.0.88.* in /venv/main/lib/python3.12/site-packages (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==13.0.2; platform_system == "Linux"->torch>=2.2->counterfactual-representation-network==0.1.0) (13.0.88)
+Requirement already satisfied: nvidia-nvtx==13.0.85.* in /venv/main/lib/python3.12/site-packages (from cuda-toolkit[cublas,cudart,cufft,cufile,cupti,curand,cusolver,cusparse,nvjitlink,nvrtc,nvtx]==13.0.2; platform_system == "Linux"->torch>=2.2->counterfactual-representation-network==0.1.0) (13.0.85)
+Requirement already satisfied: cuda-pathfinder~=1.1 in /venv/main/lib/python3.12/site-packages (from cuda-bindings<14,>=13.0.3->torch>=2.2->counterfactual-representation-network==0.1.0) (1.5.0)
+Requirement already satisfied: mpmath<1.4,>=1.1.0 in /venv/main/lib/python3.12/site-packages (from sympy>=1.13.3->torch>=2.2->counterfactual-representation-network==0.1.0) (1.3.0)
+Requirement already satisfied: click>=8.2.0 in /venv/main/lib/python3.12/site-packages (from wandb>=0.17->counterfactual-representation-network==0.1.0) (8.3.1)
+Collecting gitpython!=3.1.29,>=1.0.0 (from wandb>=0.17->counterfactual-representation-network==0.1.0)
+  Downloading gitpython-3.1.50-py3-none-any.whl.metadata (14 kB)
+Requirement already satisfied: platformdirs in /venv/main/lib/python3.12/site-packages (from wandb>=0.17->counterfactual-representation-network==0.1.0) (4.9.4)
+Collecting protobuf!=5.28.0,!=5.29.0,<8,>4.21.0 (from wandb>=0.17->counterfactual-representation-network==0.1.0)
+  Downloading protobuf-7.35.0-cp310-abi3-manylinux2014_x86_64.whl.metadata (595 bytes)
+Collecting pydantic<3,>=2.6 (from wandb>=0.17->counterfactual-representation-network==0.1.0)
+  Downloading pydantic-2.13.4-py3-none-any.whl.metadata (109 kB)
+Collecting requests<3,>=2.0.0 (from wandb>=0.17->counterfactual-representation-network==0.1.0)
+  Downloading requests-2.34.2-py3-none-any.whl.metadata (4.8 kB)
+Collecting sentry-sdk>=2.0.0 (from wandb>=0.17->counterfactual-representation-network==0.1.0)
+  Downloading sentry_sdk-2.60.0-py3-none-any.whl.metadata (10 kB)
+Collecting annotated-types>=0.6.0 (from pydantic<3,>=2.6->wandb>=0.17->counterfactual-representation-network==0.1.0)
+  Downloading annotated_types-0.7.0-py3-none-any.whl.metadata (15 kB)
+Collecting pydantic-core==2.46.4 (from pydantic<3,>=2.6->wandb>=0.17->counterfactual-representation-network==0.1.0)
+  Downloading pydantic_core-2.46.4-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl.metadata (6.6 kB)
+Collecting typing-inspection>=0.4.2 (from pydantic<3,>=2.6->wandb>=0.17->counterfactual-representation-network==0.1.0)
+  Downloading typing_inspection-0.4.2-py3-none-any.whl.metadata (2.6 kB)
+Collecting charset_normalizer<4,>=2 (from requests<3,>=2.0.0->wandb>=0.17->counterfactual-representation-network==0.1.0)
+  Downloading charset_normalizer-3.4.7-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl.metadata (40 kB)
+Requirement already satisfied: idna<4,>=2.5 in /venv/main/lib/python3.12/site-packages (from requests<3,>=2.0.0->wandb>=0.17->counterfactual-representation-network==0.1.0) (3.11)
+Collecting urllib3<3,>=1.26 (from requests<3,>=2.0.0->wandb>=0.17->counterfactual-representation-network==0.1.0)
+  Downloading urllib3-2.7.0-py3-none-any.whl.metadata (6.9 kB)
+Requirement already satisfied: certifi>=2023.5.7 in /venv/main/lib/python3.12/site-packages (from requests<3,>=2.0.0->wandb>=0.17->counterfactual-representation-network==0.1.0) (2026.2.25)
+Collecting gitdb<5,>=4.0.1 (from gitpython!=3.1.29,>=1.0.0->wandb>=0.17->counterfactual-representation-network==0.1.0)
+  Downloading gitdb-4.0.12-py3-none-any.whl.metadata (1.2 kB)
+Collecting smmap<6,>=3.0.1 (from gitdb<5,>=4.0.1->gitpython!=3.1.29,>=1.0.0->wandb>=0.17->counterfactual-representation-network==0.1.0)
+  Downloading smmap-5.0.3-py3-none-any.whl.metadata (4.6 kB)
+Requirement already satisfied: MarkupSafe>=2.0 in /venv/main/lib/python3.12/site-packages (from jinja2->torch>=2.2->counterfactual-representation-network==0.1.0) (3.0.3)
+Downloading h5py-3.16.0-cp312-cp312-manylinux_2_28_x86_64.whl (5.4 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 5.4/5.4 MB 66.4 MB/s  0:00:00
+Downloading pandas-3.0.3-cp312-cp312-manylinux_2_24_x86_64.manylinux_2_28_x86_64.whl (10.9 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 10.9/10.9 MB 129.7 MB/s  0:00:00
+Using cached pytest-9.0.3-py3-none-any.whl (375 kB)
+Using cached pluggy-1.6.0-py3-none-any.whl (20 kB)
+Using cached iniconfig-2.3.0-py3-none-any.whl (7.5 kB)
+Downloading scikit_learn-1.8.0-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl (8.9 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 8.9/8.9 MB 122.6 MB/s  0:00:00
+Downloading joblib-1.5.3-py3-none-any.whl (309 kB)
+Downloading scipy-1.17.1-cp312-cp312-manylinux_2_27_x86_64.manylinux_2_28_x86_64.whl (35.2 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 35.2/35.2 MB 134.3 MB/s  0:00:00
+Downloading threadpoolctl-3.6.0-py3-none-any.whl (18 kB)
+Downloading setuptools-81.0.0-py3-none-any.whl (1.1 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 1.1/1.1 MB 64.8 MB/s  0:00:00
+Downloading wandb-0.27.0-py3-none-manylinux_2_28_x86_64.whl (27.3 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 27.3/27.3 MB 127.6 MB/s  0:00:00
+Downloading protobuf-7.35.0-cp310-abi3-manylinux2014_x86_64.whl (327 kB)
+Downloading pydantic-2.13.4-py3-none-any.whl (472 kB)
+Downloading pydantic_core-2.46.4-cp312-cp312-manylinux_2_17_x86_64.manylinux2014_x86_64.whl (2.1 MB)
+   ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━ 2.1/2.1 MB 117.4 MB/s  0:00:00
+Downloading requests-2.34.2-py3-none-any.whl (73 kB)
+Downloading charset_normalizer-3.4.7-cp312-cp312-manylinux2014_x86_64.manylinux_2_17_x86_64.manylinux_2_28_x86_64.whl (216 kB)
+Downloading urllib3-2.7.0-py3-none-any.whl (131 kB)
+Downloading annotated_types-0.7.0-py3-none-any.whl (13 kB)
+Downloading gitpython-3.1.50-py3-none-any.whl (212 kB)
+Downloading gitdb-4.0.12-py3-none-any.whl (62 kB)
+Downloading smmap-5.0.3-py3-none-any.whl (24 kB)
+Downloading sentry_sdk-2.60.0-py3-none-any.whl (475 kB)
+Downloading typing_inspection-0.4.2-py3-none-any.whl (14 kB)
+Building wheels for collected packages: counterfactual-representation-network
+  Building editable for counterfactual-representation-network (pyproject.toml): started
+  Building editable for counterfactual-representation-network (pyproject.toml): finished with status 'done'
+  Created wheel for counterfactual-representation-network: filename=counterfactual_representation_network-0.1.0-0.editable-py3-none-any.whl size=5024 sha256=dc3d803a00c3dd95984911bd13a5b8787c928f2d88e2ae05d42bf19458f6db26
+  Stored in directory: /tmp/pip-ephem-wheel-cache-ebz0mc2l/wheels/ab/09/ac/301507213501d68789997344c31df3758c87982e02e446c4c5
+Successfully built counterfactual-representation-network
+Installing collected packages: urllib3, typing-inspection, threadpoolctl, smmap, setuptools, scipy, pydantic-core, protobuf, pluggy, joblib, iniconfig, h5py, charset_normalizer, annotated-types, sentry-sdk, scikit-learn, requests, pytest, pydantic, pandas, gitdb, gitpython, wandb, counterfactual-representation-network
+  Attempting uninstall: setuptools
+    Found existing installation: setuptools 82.0.1
+    Uninstalling setuptools-82.0.1:
+      Successfully uninstalled setuptools-82.0.1
+
+Successfully installed annotated-types-0.7.0 charset_normalizer-3.4.7 counterfactual-representation-network-0.1.0 gitdb-4.0.12 gitpython-3.1.50 h5py-3.16.0 iniconfig-2.3.0 joblib-1.5.3 pandas-3.0.3 pluggy-1.6.0 protobuf-7.35.0 pydantic-2.13.4 pydantic-core-2.46.4 pytest-9.0.3 requests-2.34.2 scikit-learn-1.8.0 scipy-1.17.1 sentry-sdk-2.60.0 setuptools-81.0.0 smmap-5.0.3 threadpoolctl-3.6.0 typing-inspection-0.4.2 urllib3-2.7.0 wandb-0.27.0
+WARNING: Running pip as the 'root' user can result in broken permissions and conflicting behaviour with the system package manager, possibly rendering your system unusable. It is recommended to use a virtual environment instead: https://pip.pypa.io/warnings/venv. Use the --root-user-action option if you know what you are doing and want to suppress this warning.
+.....                                                                    [100%]
+5 passed in 4.67s
+.....                                                                    [100%]
+5 passed in 3.60s
+
+  0%|          | 0/2 [00:00<?, ?it/s]
+ 50%|█████     | 1/2 [00:01<00:01,  1.18s/it]
+                                             
+
+  0%|          | 0/1 [00:00<?, ?it/s]
+                                     
+{'epoch': 1, 'train_loss': 1.8060424327850342, 'val_loss': 1.8254913091659546, 'warmup_factor': 1.0, 'checkpoint_metric': {'loss/total': 1.8254913091659546}}
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from WANDB_API_KEY.
+wandb: Currently logged in as: 22520982 (21522798-uit) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: WARNING Using a boolean value for 'reinit' is deprecated. Use 'return_previous' or 'finish_previous' instead.
+wandb: Tracking run with wandb version 0.27.0
+wandb: Run data is saved locally in runs/brats_smoke_multiregion/wandb/run-20260524_162134-k8pc9342
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run brats_smoke_multiregion
+wandb: ⭐️ View project at https://wandb.ai/21522798-uit/counterfactual-representation-network
+wandb: 🚀 View run at https://wandb.ai/21522798-uit/counterfactual-representation-network/runs/k8pc9342
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/workspace/Counterfactual-Representation-Network/src/crn/train.py", line 667, in <module>
+    main()
+  File "/workspace/Counterfactual-Representation-Network/src/crn/train.py", line 663, in main
+    train(load_yaml(args.config))
+  File "/workspace/Counterfactual-Representation-Network/src/crn/train.py", line 516, in train
+    wandb_run = init_wandb_run(
+                ^^^^^^^^^^^^^^^
+  File "/workspace/Counterfactual-Representation-Network/src/crn/wandb_support.py", line 64, in init_wandb_run
+    log_code_snapshot(run)
+  File "/workspace/Counterfactual-Representation-Network/src/crn/wandb_support.py", line 71, in log_code_snapshot
+    code_artifact = wandb.Artifact("source-code", type="code")
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/main/lib/python3.12/site-packages/wandb/sdk/artifacts/artifact.py", line 212, in __init__
+    self._type: str = validate_artifact_type(type, name)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/venv/main/lib/python3.12/site-packages/wandb/sdk/artifacts/_validators.py", line 196, in validate_artifact_type
+    raise ValueError(
+ValueError: Artifact type 'code' is reserved for internal use. Please use a different type.
+[1;34mwandb[0m: 
+[1;34mwandb[0m: 🚀 View run [33mbrats_smoke_multiregion[0m at: [34mhttps://wandb.ai/21522798-uit/counterfactual-representation-network/runs/k8pc9342[0m
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from WANDB_API_KEY.
+wandb: Currently logged in as: 22520982 (21522798-uit) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: WARNING Using a boolean value for 'reinit' is deprecated. Use 'return_previous' or 'finish_previous' instead.
+wandb: setting up run aj7w01hp
+wandb: Tracking run with wandb version 0.27.0
+wandb: Run data is saved locally in runs/brats_smoke_multiregion/wandb/run-20260524_162202-aj7w01hp
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run brats_smoke_multiregion
+wandb: ⭐️ View project at https://wandb.ai/21522798-uit/counterfactual-representation-network
+wandb: 🚀 View run at https://wandb.ai/21522798-uit/counterfactual-representation-network/runs/aj7w01hp
+
+  0%|          | 0/2 [00:00<?, ?it/s]
+ 50%|█████     | 1/2 [00:00<00:00,  1.14it/s]
+                                             
+
+  0%|          | 0/1 [00:00<?, ?it/s]
+                                     
+{'epoch': 1, 'train_loss': 1.8063256740570068, 'val_loss': 1.8255000114440918, 'warmup_factor': 1.0, 'checkpoint_metric': {'loss/total': 1.8255000114440918}}
+wandb: updating run metadata; uploading artifact brats_smoke_multiregion-checkpoint; uploading artifact brats_smoke_multiregion-checkpoint
+wandb: uploading artifact brats_smoke_multiregion-checkpoint; uploading artifact brats_smoke_multiregion-checkpoint
+wandb: uploading artifact brats_smoke_multiregion-checkpoint
+wandb: uploading history steps 0-0, summary, console lines 0-1
+wandb: 
+wandb: Run history:
+wandb:         epoch ▁
+wandb: warmup_factor ▁
+wandb: 
+wandb: Run summary:
+wandb:         epoch 1
+wandb: warmup_factor 1
+wandb: 
+wandb: 🚀 View run brats_smoke_multiregion at: https://wandb.ai/21522798-uit/counterfactual-representation-network/runs/aj7w01hp
+wandb: ⭐️ View project at: https://wandb.ai/21522798-uit/counterfactual-representation-network
+wandb: Synced 5 W&B file(s), 0 media file(s), 66 artifact file(s) and 0 other file(s)
+wandb: Find logs at: runs/brats_smoke_multiregion/wandb/run-20260524_162202-aj7w01hp/logs
+wandb: [wandb.login()] Loaded credentials for https://api.wandb.ai from WANDB_API_KEY.
+wandb: Currently logged in as: 22520982 (21522798-uit) to https://api.wandb.ai. Use `wandb login --relogin` to force relogin
+wandb: WARNING Using a boolean value for 'reinit' is deprecated. Use 'return_previous' or 'finish_previous' instead.
+wandb: Tracking run with wandb version 0.27.0
+wandb: Run data is saved locally in runs/brats_smoke_multiregion/wandb/run-20260524_162223-bkicprst
+wandb: Run `wandb offline` to turn off syncing.
+wandb: Syncing run best-val-eval
+wandb: ⭐️ View project at https://wandb.ai/21522798-uit/counterfactual-representation-network
+wandb: 🚀 View run at https://wandb.ai/21522798-uit/counterfactual-representation-network/runs/bkicprst
+
+  0%|          | 0/1 [00:00<?, ?it/s]
+100%|██████████| 1/1 [00:00<00:00,  1.82it/s]
+                                             
+wandb: updating run metadata; uploading artifact best-val-metrics
+wandb: uploading artifact best-val-metrics
+wandb: WARNING Artifact "source-code" already exists with the same content. No new version will be created.
+wandb: 
+wandb: Run history:
+wandb:                    brats/ET/dice ▁
+wandb:                     brats/ET/iou ▁
+wandb:               brats/ET/precision ▁
+wandb:   brats/ET/pred_foreground_ratio ▁
+wandb:                  brats/ET/recall ▁
+wandb: brats/ET/target_foreground_ratio ▁
+wandb:                    brats/TC/dice ▁
+wandb:                     brats/TC/iou ▁
+wandb:               brats/TC/precision ▁
+wandb:   brats/TC/pred_foreground_ratio ▁
+wandb:                              +68 ...
+wandb: 
+wandb: Run summary:
+wandb:                    brats/ET/dice 0.5
+wandb:                     brats/ET/iou 0.5
+wandb:               brats/ET/precision 1
+wandb:   brats/ET/pred_foreground_ratio 0
+wandb:                  brats/ET/recall 0.5
+wandb: brats/ET/target_foreground_ratio 0.00781
+wandb:                    brats/TC/dice 0.21538
+wandb:                     brats/TC/iou 0.13281
+wandb:               brats/TC/precision 0.13281
+wandb:   brats/TC/pred_foreground_ratio 1
+wandb:                              +70 ...
+wandb: 
+wandb: 🚀 View run best-val-eval at: https://wandb.ai/21522798-uit/counterfactual-representation-network/runs/bkicprst
+wandb: ⭐️ View project at: https://wandb.ai/21522798-uit/counterfactual-representation-network
+wandb: Synced 5 W&B file(s), 0 media file(s), 3 artifact file(s) and 0 other file(s)
+wandb: Find logs at: runs/brats_smoke_multiregion/wandb/run-20260524_162223-bkicprst/logs
+{'loss/cls': 0.7325623035430908, 'loss/seg': 1.5218538045883179, 'loss/region_supervision': 0.0, 'loss/seg_adjustment': 0.0, 'loss/region_adjustment': 0.0, 'loss/rec': 0.21242061257362366, 'loss/dis': 7.700911737629212e-06, 'loss/adjustment': 0.7325623035430908, 'loss/cf_stability': 0.0, 'loss/seg_cf_stability': 0.0, 'loss/region_cf_stability': 0.0, 'loss/disease_swap': 0.7325623035430908, 'loss/seg_disease_swap': 0.0, 'loss/region_disease_swap': 0.0, 'loss/region_cf_contrastive': 0.0, 'weighted/cls': 0.1831405758857727, 'weighted/seg': 1.5218538045883179, 'weighted/region_supervision': 0.0, 'weighted/seg_adjustment': 0.0, 'weighted/region_adjustment': 0.0, 'weighted/rec': 0.010621030814945698, 'weighted/dis': 7.700911908159469e-08, 'weighted/adjustment': 0.0732562318444252, 'weighted/cf_stability': 0.0, 'weighted/seg_cf_stability': 0.0, 'weighted/region_cf_stability': 0.0, 'weighted/region_cf_contrastive': 0.0, 'weighted/seg_disease_swap': 0.0, 'weighted/region_disease_swap': 0.0, 'weighted/disease_swap': 0.0366281159222126, 'loss/total': 1.8255000114440918, 'cls/prob_mean': 0.637661874294281, 'cls/label_mean': 0.5, 'cls/accuracy': 0.5, 'cls/balanced_accuracy': 0.5, 'cls/sensitivity': 1.0, 'cls/specificity': 0.0, 'cls/auroc': 0.5, 'cls/average_precision': 0.5, 'seg/macro_dice_mean': 0.40512824058532715, 'seg/macro_iou_mean': 0.3776041567325592, 'seg/macro_precision_mean': 0.7109375, 'seg/macro_recall_mean': 0.6666666865348816, 'seg/pred_foreground_ratio': 0.3333333432674408, 'seg/target_foreground_ratio': 0.0572916679084301, 'seg/ncr_net/dice': 0.2153846174478531, 'seg/ncr_net/iou': 0.1328125, 'seg/ncr_net/precision': 0.1328125, 'seg/ncr_net/recall': 1.0, 'seg/edema/dice': 0.5, 'seg/edema/iou': 0.5, 'seg/edema/precision': 1.0, 'seg/edema/recall': 0.5, 'seg/enhancing_tumor/dice': 0.5000000596046448, 'seg/enhancing_tumor/iou': 0.5000000596046448, 'seg/enhancing_tumor/precision': 1.0, 'seg/enhancing_tumor/recall': 0.5000000596046448, 'brats/WT/dice': 0.2153846174478531, 'brats/WT/iou': 0.1328125, 'brats/WT/precision': 0.1328125, 'brats/WT/recall': 1.0, 'brats/WT/pred_foreground_ratio': 1.0, 'brats/WT/target_foreground_ratio': 0.1328125, 'brats/TC/dice': 0.2153846174478531, 'brats/TC/iou': 0.1328125, 'brats/TC/precision': 0.1328125, 'brats/TC/recall': 1.0, 'brats/TC/pred_foreground_ratio': 1.0, 'brats/TC/target_foreground_ratio': 0.1328125, 'brats/ET/dice': 0.5000000596046448, 'brats/ET/iou': 0.5000000596046448, 'brats/ET/precision': 1.0, 'brats/ET/recall': 0.5000000596046448, 'brats/ET/pred_foreground_ratio': 0.0, 'brats/ET/target_foreground_ratio': 0.0078125, 'brats/mean_dice': 0.310256431500117, 'eval/epoch': 1, 'eval/split': 'val', 'eval/checkpoint': 'runs/brats_smoke_multiregion/best.pt', 'eval/threshold_used': 0.5}

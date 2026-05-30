@@ -31,18 +31,7 @@ model:
   num_classes: 1
   num_seg_classes: 3
   head_uses_context: true
-
-loss:
-  lambda_cls: 0.25
-  lambda_seg: 1.0
-  lambda_rec: 0.05
-  lambda_dis: 0.01
-  lambda_adjustment: 0.10
-  lambda_cf_stability: 0.05
-  lambda_seg_cf_stability: 0.02
-  lambda_disease_swap: 0.05
-  context_stability_margin: 0.10
-  adjustment_contexts: 2
+  backbone_mode: 2d
 
 training:
   batch_size: 2
@@ -52,5 +41,5 @@ training:
   lr: 0.0002
   weight_decay: 0.0001
   num_workers: 0
-  output_dir: runs/brats_smoke_multiregion
+  output_dir: runs/brats_smoke_2d
   device: auto

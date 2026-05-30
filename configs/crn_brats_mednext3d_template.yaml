@@ -1,0 +1,78 @@
+# Template config for MedNeXt 3D backbone on BraTS-style data.
+#
+# Backbone choices (set in model.backbone_mode):
+#   - "2d" or "planar"           -> standard 2D CNN encoder + 2D decoder
+#   - "3d", "2.5d", "volumetric" -> 3D CNN encoder (ConvBlock3D) + volumetric UNet decoder
+#   - "mednext", "mednext3d"     -> MedNeXt 3D encoder + volumetric UNet decoder
+#
+# MedNeXt-specific knobs:
+#   mednext_variant : S | B | M | L   (model size, default L)
+#   mednext_kernel_size : 3 | 5 | 7   (depthwise kernel, default 5)
+#   base_channels : if set, overrides the variant's default n_channels
+#
+# For volumetric backbones you should use slice_context > 1 with slice_context_layout: depth
+# so that neighbouring slices are stacked along the depth dimension.
+
+seed: 7
+
+data:
+  train_csv: data/smoke3d/brats_train.csv
+  val_csv: data/smoke3d/brats_val.csv
+  image_root: data/smoke/brats
+  image_col: path
+  mask_col: mask
+  label_cols:
+    - target
+  h5_image_key: image
+  h5_mask_key: mask
+  mask_mode: brats_subregions
+  brats_channel_names:
+    - ncr_net
+    - edema
+    - enhancing_tumor
+  brats_region_channels:
+    WT: [0, 1, 2]
+    TC: [0, 2]
+    ET: [2]
+  image_normalization: minmax
+  image_size: [32, 32]
+  in_channels: 4
+  slice_context: 3
+  slice_context_layout: depth
+  uncertain_value: 0.0
+  missing_label_value: 0.0
+
+model:
+  latent_dim: 16
+  base_channels: 16
+  num_classes: 1
+  num_seg_classes: 3
+  head_uses_context: true
+  segmentation_head: unet          # required for volumetric backbones
+  backbone_mode: mednext           # <<< change to "2d", "3d", or "mednext"
+  mednext_variant: S               # <<< S / B / M / L
+  mednext_kernel_size: 5           # <<< 3 / 5 / 7
+  norm_type: group
+  group_norm_groups: 8
+
+loss:
+  lambda_cls: 0.25
+  lambda_seg: 1.0
+  lambda_rec: 0.05
+  lambda_dis: 0.01
+  lambda_adjustment: 0.10
+  lambda_cf_stability: 0.05
+  lambda_seg_cf_stability: 0.02
+  lambda_disease_swap: 0.05
+  context_stability_margin: 0.10
+  adjustment_contexts: 2
+
+training:
+  batch_size: 1
+  epochs: 1
+  max_train_batches: 2
+  lr: 0.0002
+  weight_decay: 0.0001
+  num_workers: 0
+  output_dir: runs/brats_smoke_mednext3d
+  device: auto

@@ -31,6 +31,7 @@ from crn.metrics import (
     postprocess_binary_volume,
 )
 from crn.train import build_model
+from crn.wandb_support import finish_wandb_run, init_wandb_run, log_metrics, log_path_artifact
 from crn.utils import load_yaml, move_batch_to_device, resolve_device, save_json
 
 
@@ -1141,6 +1142,12 @@ def evaluate(
 ) -> dict[str, Any]:
     checkpoint = torch.load(checkpoint_path, map_location="cpu")
     config = _load_config(checkpoint, config_path)
+    wandb_run = init_wandb_run(
+        config=config,
+        output_dir=Path(checkpoint_path).parent,
+        run_name=f"{Path(checkpoint_path).stem}-{split}-eval",
+        job_type="evaluate",
+    )
 
     data_config = dict(config["data"])
     train_config = dict(config.get("training", {}))
@@ -1325,6 +1332,38 @@ def evaluate(
         checkpoint_path_obj = Path(checkpoint_path)
         output_path = checkpoint_path_obj.with_name(f"{checkpoint_path_obj.stem}_{split}_metrics.json")
     save_json(metrics, output_path)
+    log_metrics(wandb_run, metrics)
+    log_path_artifact(
+        wandb_run,
+        output_path,
+        artifact_name=f"{Path(checkpoint_path).stem}-{split}-metrics",
+        artifact_type="metrics",
+        aliases=["latest"],
+    )
+    if "qualitative/output_dir" in metrics:
+        log_path_artifact(
+            wandb_run,
+            metrics["qualitative/output_dir"],
+            artifact_name=f"{Path(checkpoint_path).stem}-{split}-qualitative",
+            artifact_type="qualitative",
+        )
+    if "cf/output_path" in metrics:
+        log_path_artifact(
+            wandb_run,
+            metrics["cf/output_path"],
+            artifact_name=f"{Path(checkpoint_path).stem}-{split}-counterfactual",
+            artifact_type="counterfactual",
+        )
+    if "region_tuned/output_path" in metrics:
+        log_path_artifact(
+            wandb_run,
+            metrics["region_tuned/output_path"],
+            artifact_name=f"{Path(checkpoint_path).stem}-{split}-region-tuning",
+            artifact_type="region-tuning",
+        )
+    if wandb_run is not None:
+        wandb_run.summary.update({key: value for key, value in metrics.items() if isinstance(value, (int, float, str, bool))})
+    finish_wandb_run(wandb_run)
     return metrics
 
 

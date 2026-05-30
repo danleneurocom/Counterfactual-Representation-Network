@@ -22,6 +22,7 @@ from crn.metrics import (
     multilabel_volume_metrics_from_probs,
 )
 from crn.models import CounterfactualRepresentationNetwork
+from crn.wandb_support import finish_wandb_run, init_wandb_run, log_metrics, log_path_artifact
 from crn.utils import (
     load_yaml,
     move_batch_to_device,
@@ -512,6 +513,18 @@ def train(config: dict[str, Any]) -> None:
     output_dir = Path(train_config.get("output_dir", "runs/crn"))
     output_dir.mkdir(parents=True, exist_ok=True)
     save_json(config, output_dir / "config.resolved.json")
+    wandb_run = init_wandb_run(
+        config=config,
+        output_dir=output_dir,
+        run_name=output_dir.name,
+        job_type="train",
+    )
+    log_path_artifact(
+        wandb_run,
+        output_dir / "config.resolved.json",
+        artifact_name=f"{output_dir.name}-config",
+        artifact_type="config",
+    )
 
     train_loader = make_dataloader(data_config, "train", shuffle=True)
     val_loader = make_dataloader(data_config, "val", shuffle=False)
@@ -585,6 +598,16 @@ def train(config: dict[str, Any]) -> None:
         if checkpoint_metric_key in val_logs:
             log_line["checkpoint_metric"] = {checkpoint_metric_key: val_logs[checkpoint_metric_key]}
         print(log_line)
+        log_metrics(
+            wandb_run,
+            {
+                "epoch": epoch,
+                "train": train_logs,
+                "val": val_logs,
+                "warmup_factor": warmup_factor,
+            },
+            step=epoch,
+        )
         save_json(
             {
                 "epoch": epoch,
@@ -607,10 +630,26 @@ def train(config: dict[str, Any]) -> None:
             "monitor_tiebreak_value": secondary_value,
         }
         torch.save(checkpoint, output_dir / "last.pt")
+        log_path_artifact(
+            wandb_run,
+            output_dir / "last.pt",
+            artifact_name=f"{output_dir.name}-checkpoint",
+            artifact_type="checkpoint",
+            aliases=["last"],
+        )
         if best_update:
             best_primary = primary_value
             best_secondary = secondary_value
             torch.save(checkpoint, output_dir / "best.pt")
+            log_path_artifact(
+                wandb_run,
+                output_dir / "best.pt",
+                artifact_name=f"{output_dir.name}-checkpoint",
+                artifact_type="checkpoint",
+                aliases=["best"],
+            )
+
+    finish_wandb_run(wandb_run)
 
 
 def parse_args() -> argparse.Namespace:

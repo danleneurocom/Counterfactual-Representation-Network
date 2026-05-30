@@ -868,7 +868,11 @@ def compute_crn_losses(
         terms["region_adjustment"] = zero
 
     if cfg.lambda_rec and "reconstruction" in outputs:
-        terms["rec"] = reconstruction_loss(outputs["reconstruction"], batch["image"])
+        image = batch["image"]
+        if image.ndim == 5 and outputs["reconstruction"].ndim == 4:
+            center_idx = image.shape[2] // 2
+            image = image[:, :, center_idx]
+        terms["rec"] = reconstruction_loss(outputs["reconstruction"], image)
     else:
         terms["rec"] = zero
 
