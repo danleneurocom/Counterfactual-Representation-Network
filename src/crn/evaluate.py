@@ -1363,6 +1363,7 @@ def evaluate(
         )
     if wandb_run is not None:
         wandb_run.summary.update({key: value for key, value in metrics.items() if isinstance(value, (int, float, str, bool))})
+    print(metrics, flush=True)
     finish_wandb_run(wandb_run)
     return metrics
 
@@ -1432,7 +1433,6 @@ def main() -> None:
         counterfactual_max_volumes=args.counterfactual_max_volumes,
         counterfactual_skip_adebayo=args.counterfactual_skip_adebayo,
     )
-    print(metrics)
 
 
 if __name__ == "__main__":
