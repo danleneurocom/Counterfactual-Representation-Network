@@ -559,6 +559,9 @@ def train(config: dict[str, Any]) -> None:
     base_threshold = float(train_config.get("checkpoint_threshold", 0.5))
     threshold_sweep = _parse_threshold_sweep(train_config.get("checkpoint_threshold_sweep"))
     loss_warmup = train_config.get("loss_warmup")
+    early_stopping = train_config.get("early_stopping")
+    patience = int(early_stopping.get("patience", 0)) if early_stopping else 0
+    epochs_without_improvement = 0
     for epoch in range(1, epochs + 1):
         loss_config_epoch, warmup_factor = _effective_loss_config(config.get("loss", {}), epoch, loss_warmup)
         train_logs = run_epoch(
@@ -648,6 +651,15 @@ def train(config: dict[str, Any]) -> None:
                 artifact_type="checkpoint",
                 aliases=["best"],
             )
+            epochs_without_improvement = 0
+        else:
+            epochs_without_improvement += 1
+
+        if patience > 0 and epochs_without_improvement >= patience:
+            print(f"Early stopping triggered after {epoch} epochs (no improvement for {patience} epochs).")
+            if wandb_run is not None:
+                wandb_run.log({"early_stopping_epoch": epoch}, step=epoch)
+            break
 
     finish_wandb_run(wandb_run)
 

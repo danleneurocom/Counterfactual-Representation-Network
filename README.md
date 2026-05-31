@@ -43,7 +43,7 @@ python -m pip install ".[dev]"
 Install a PyTorch build appropriate for your machine if the default dependency resolver does not choose one:
 
 ```bash
-python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+pip install torch --index-url https://download.pytorch.org/whl/cuda132
 ```
 
 ## Data Format
@@ -71,8 +71,8 @@ For the Kaggle-style BraTS2020 HDF5 slices, prepare volume-level train/validatio
 ```bash
 python scripts/prepare_brats_metadata.py \
   --metadata "BraTS20 Training Metadata.csv" \
-  --data-root /Users/lenguyenlinhdan/Downloads/content/data \
-  --output-dir data/brats \
+  --data-root data/brats20 \
+  --output-dir data/brats-kaggle \
   --require-files
 ```
 
