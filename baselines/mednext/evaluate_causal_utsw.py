@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from pathlib import Path
 from typing import Any
@@ -415,6 +416,19 @@ def _batch_case_ids(batch: dict[str, Any], batch_size: int) -> list[str]:
     return [f"{case_ids}_{index}" for index in range(batch_size)]
 
 
+def _stable_style_seed(base_seed: int, sample_index: int, case_ids: list[str]) -> int:
+    """Make style interventions reproducible for a case/sample, independent of loader order."""
+    key = f"{int(base_seed)}:{int(sample_index)}:{'|'.join(case_ids)}".encode("utf-8")
+    digest = hashlib.blake2b(key, digest_size=8).digest()
+    return int.from_bytes(digest, byteorder="little", signed=False) % (2**31 - 1)
+
+
+def _style_rng_devices(device: torch.device) -> list[int]:
+    if device.type != "cuda":
+        return []
+    return [0 if device.index is None else int(device.index)]
+
+
 def _case_metrics(logits: Tensor, target: Tensor, threshold: float) -> dict[str, float]:
     return brats_region_metrics(
         logits.detach().cpu(),
@@ -566,6 +580,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     for batch_idx, batch in enumerate(tqdm(eval_loader, desc=f"mednext-causal-eval:{args.split}", leave=False), start=1):
         image = batch["image"].to(device)
         target = batch["mask"].to(device)
+        batch_case_ids = _batch_case_ids(batch, image.shape[0])
         outputs = model(image, context_bank=bank_device, max_adjustment_contexts=args.adjustment_contexts)
         logits = outputs["logits"]
         if not isinstance(logits, Tensor):
@@ -626,8 +641,15 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
 
         if args.style_tta_samples > 0:
             tta_logits = [logits]
-            for _ in range(int(args.style_tta_samples)):
-                style_image = apply_style_intervention(image, args)
+            rng_devices = _style_rng_devices(device)
+            for sample_index in range(int(args.style_tta_samples)):
+                if args.deterministic_style_tta:
+                    style_seed = _stable_style_seed(args.seed, sample_index, batch_case_ids)
+                    with torch.random.fork_rng(devices=rng_devices):
+                        torch.manual_seed(style_seed)
+                        style_image = apply_style_intervention(image, args)
+                else:
+                    style_image = apply_style_intervention(image, args)
                 style_image = _scope_style_intervention(image, style_image, style_modalities)
                 style_outputs = model(style_image, context_bank=None)
                 style_logits = style_outputs["logits"]
@@ -646,9 +668,8 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                     max_tc_voxels=args.nonenhancing_core_max_tc_voxels,
                     metadata_gate=args.nonenhancing_core_metadata_gate,
                 )
-                case_ids = _batch_case_ids(batch, logits.shape[0])
                 nonenhancing_core_completion_cases.extend(
-                    case_id for case_id, did_complete in zip(case_ids, completion_mask, strict=True) if did_complete
+                    case_id for case_id, did_complete in zip(batch_case_ids, completion_mask, strict=True) if did_complete
                 )
             if args.nested_region_consistency:
                 style_tta_logits = _apply_nested_region_consistency(style_tta_logits)
@@ -695,7 +716,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
                 variants["adjusted"] = adjusted
             if isinstance(style_tta_logits, Tensor):
                 variants["style_tta"] = style_tta_logits
-            for item_index, case_id in enumerate(_batch_case_ids(batch, logits.shape[0])):
+            for item_index, case_id in enumerate(batch_case_ids):
                 case_records.append(
                     _case_record(
                         case_id,
@@ -725,6 +746,7 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "context_bank_size": float(0 if context_bank is None else context_bank.shape[0]),
         "seed": int(args.seed),
         "style_tta_samples": int(args.style_tta_samples),
+        "deterministic_style_tta": bool(args.deterministic_style_tta),
         "style_tta_fusion": str(args.style_tta_fusion),
         "style_tta_modalities": "all" if style_modalities is None else ",".join(UTSW_MODALITIES[index] for index in style_modalities),
         "nonenhancing_core_completion": bool(args.nonenhancing_core_completion),
@@ -807,6 +829,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--use-ants-modalities", action="store_true", default=None)
     parser.add_argument("--allow-missing-metadata", action="store_true")
     parser.add_argument("--style-tta-samples", type=int, default=0)
+    parser.add_argument("--deterministic-style-tta", action="store_true")
     parser.add_argument("--style-tta-modalities", default="all")
     parser.add_argument(
         "--style-tta-fusion",
