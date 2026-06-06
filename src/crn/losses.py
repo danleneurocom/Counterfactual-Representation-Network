@@ -483,7 +483,7 @@ class CounterfactualMemory:
             examples["mask"] = torch.stack(
                 [_weighted_mix(self.exemplar_masks, slots, weights, dtype=torch.float32) for slots, weights in zip(mixture_slots, mixture_weights)],
                 dim=0,
-            )
+            ).clamp(0.0, 1.0)
         if require_features:
             if self.exemplar_disease_features is None:
                 return None

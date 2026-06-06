@@ -1,5 +1,17 @@
 # Counterfactual Representation Network
 
+## Restart Status
+
+This repository is being reset to a baseline-first causal pipeline. The first
+new milestone is a faithful SegFormer3D segmentation baseline under
+`baselines/segformer3d/`; causal components should be added only after the
+causal question, assumptions, graph, identification strategy, and estimator are
+written down. See `docs/revised_methodology.md` for the restarted Pearl-style
+pipeline.
+
+The older CRN configs, runs, and notes remain in the repo as legacy experiment
+history. Treat them as prior work, not as the new methodological mainline.
+
 Research scaffold for **Counterfactual Representation Network for Fair and Interpretable Imaging**, targeting ICDM 2026.
 
 The initial draft treated context/confounders as factors to remove from prediction. The corrected framing here follows the supervisor feedback and the identifiability / proximal-inference literature: confounders can also be causal parents of the label, so prediction should condition on both latent components while estimating the intervention effect of the disease factor — and the identifiability of that factorization requires paired/counterfactual supervision, not unsupervised disentanglement (Locatello et al. 2019).

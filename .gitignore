@@ -10,7 +10,9 @@ venv/
 build/
 dist/
 
-data/
+data/brats/archive/
+data/brats/brats_train.csv
+data/brats/brats_val.csv
 runs/
 *.pt
 *.ckpt

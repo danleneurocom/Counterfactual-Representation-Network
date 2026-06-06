@@ -4,7 +4,6 @@ from typing import Any
 
 import numpy as np
 from scipy.ndimage import binary_erosion, binary_fill_holes, distance_transform_edt, generate_binary_structure, label
-from sklearn.metrics import accuracy_score, average_precision_score, balanced_accuracy_score, roc_auc_score
 import torch
 from torch import Tensor
 
@@ -221,6 +220,141 @@ def brats_region_metrics(
     return metrics
 
 
+def brats_region_metrics_from_region_logits(
+    region_logits: Tensor,
+    target: Tensor,
+    threshold: float = 0.5,
+    region_names: list[str] | None = None,
+    eps: float = 1e-6,
+) -> dict[str, float]:
+    """Score direct BraTS WT/TC/ET region logits against subregion masks.
+
+    The project usually stores labels as subregions [NCR/NET, edema, ET], while
+    BraTS reports nested regions WT=[0,1,2], TC=[0,2], ET=[2]. This helper keeps
+    region-head evaluation explicit instead of pretending WT/TC/ET logits are
+    subregion channels.
+    """
+
+    if target.ndim == region_logits.ndim - 1:
+        target = target.unsqueeze(1)
+    if target.shape[1] < 3:
+        raise ValueError(f"BraTS region metrics need at least 3 target channels, got {tuple(target.shape)}")
+    if region_logits.shape[1] != 3:
+        raise ValueError(f"Expected direct region logits with 3 channels [WT, TC, ET], got {tuple(region_logits.shape)}")
+
+    region_names = region_names or ["WT", "TC", "ET"]
+    region_target = torch.cat(
+        [
+            target[:, [0, 1, 2]].amax(dim=1, keepdim=True),
+            target[:, [0, 2]].amax(dim=1, keepdim=True),
+            target[:, 2:3],
+        ],
+        dim=1,
+    ).float()
+    region_pred = (torch.sigmoid(region_logits) >= threshold).float()
+
+    dice, iou, precision, recall = _segmentation_stats(region_pred, region_target, eps)
+    metrics: dict[str, float] = {
+        "brats/pred_foreground_ratio": float(region_pred.mean().item()),
+        "brats/target_foreground_ratio": float(region_target.mean().item()),
+    }
+    region_dice: list[float] = []
+    for idx, region_name in enumerate(region_names):
+        prefix = f"brats/{region_name}"
+        metrics[f"{prefix}/dice"] = float(dice[:, idx].mean().item())
+        metrics[f"{prefix}/iou"] = float(iou[:, idx].mean().item())
+        metrics[f"{prefix}/precision"] = float(precision[:, idx].mean().item())
+        metrics[f"{prefix}/recall"] = float(recall[:, idx].mean().item())
+        metrics[f"{prefix}/pred_foreground_ratio"] = float(region_pred[:, idx].mean().item())
+        metrics[f"{prefix}/target_foreground_ratio"] = float(region_target[:, idx].mean().item())
+        region_dice.append(metrics[f"{prefix}/dice"])
+    metrics["brats/mean_dice"] = float(np.mean(region_dice)) if region_dice else float("nan")
+    return metrics
+
+
+def _brats_region_numpy_masks(mask: np.ndarray) -> dict[str, np.ndarray]:
+    if mask.ndim != 4 or mask.shape[0] < 3:
+        raise ValueError(f"Expected subregion mask with shape [3, D, H, W], got {mask.shape}")
+    ncr_net = np.asarray(mask[0], dtype=bool)
+    edema = np.asarray(mask[1], dtype=bool)
+    enhancing = np.asarray(mask[2], dtype=bool)
+    return {
+        "WT": np.logical_or.reduce([ncr_net, edema, enhancing]),
+        "TC": np.logical_or(ncr_net, enhancing),
+        "ET": enhancing,
+    }
+
+
+def _enforce_brats_hierarchy(regions: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
+    et = np.asarray(regions["ET"], dtype=bool)
+    tc = np.logical_or(np.asarray(regions["TC"], dtype=bool), et)
+    wt = np.logical_or(np.asarray(regions["WT"], dtype=bool), tc)
+    return {"WT": wt, "TC": tc, "ET": et}
+
+
+def brats_structural_region_metrics(
+    logits: Tensor,
+    target: Tensor,
+    threshold: float = 0.1,
+    min_component_size: int = 16,
+    fill_holes: bool = False,
+    keep_largest: bool = False,
+    eps: float = 1e-6,
+) -> dict[str, float]:
+    """BraTS region metrics after applying an anatomical structural prior.
+
+    The prior converts subregion logits into nested WT/TC/ET masks, removes
+    tiny disconnected components, and enforces ET <= TC <= WT. This is a
+    prediction mechanism for BraTS-style tumors, not a replacement for raw
+    subregion metrics.
+    """
+
+    if target.ndim == logits.ndim - 1:
+        target = target.unsqueeze(1)
+    probs = torch.sigmoid(logits.detach().cpu())
+    target_cpu = target.detach().cpu().float()
+    if probs.ndim != 5 or probs.shape[1] < 3:
+        raise ValueError(f"Expected logits with shape [B, 3, D, H, W], got {tuple(logits.shape)}")
+
+    items: list[dict[str, float]] = []
+    for batch_idx in range(probs.shape[0]):
+        pred_sub = probs[batch_idx].numpy() >= float(threshold)
+        target_sub = target_cpu[batch_idx].numpy() > 0.5
+        pred_regions = _brats_region_numpy_masks(pred_sub)
+        target_regions = _enforce_brats_hierarchy(_brats_region_numpy_masks(target_sub))
+        processed = {
+            region_name: postprocess_binary_volume(
+                mask,
+                min_component_size=int(min_component_size),
+                fill_holes=bool(fill_holes),
+                keep_largest=bool(keep_largest),
+                connectivity=1,
+            )
+            for region_name, mask in pred_regions.items()
+        }
+        processed = _enforce_brats_hierarchy(processed)
+
+        item: dict[str, float] = {}
+        dice_values: list[float] = []
+        hd95_values: list[float] = []
+        for region_name in ("WT", "TC", "ET"):
+            region_metrics = binary_volume_metrics_from_masks(processed[region_name], target_regions[region_name], eps=eps)
+            prefix = f"brats/{region_name}"
+            item[f"{prefix}/dice"] = region_metrics["dice"]
+            item[f"{prefix}/iou"] = region_metrics["iou"]
+            item[f"{prefix}/precision"] = region_metrics["precision"]
+            item[f"{prefix}/recall"] = region_metrics["recall"]
+            item[f"{prefix}/pred_foreground_ratio"] = region_metrics["pred_foreground_ratio"]
+            item[f"{prefix}/target_foreground_ratio"] = region_metrics["target_foreground_ratio"]
+            item[f"{prefix}/hd95"] = region_metrics["hd95"]
+            dice_values.append(region_metrics["dice"])
+            hd95_values.append(region_metrics["hd95"])
+        item["brats/mean_dice"] = float(np.mean(dice_values))
+        item["brats/mean_hd95"] = float(np.mean(hd95_values))
+        items.append(item)
+    return summarize_metrics(items)
+
+
 def multilabel_volume_metrics_from_probs(
     probs: Tensor,
     target: Tensor,
@@ -300,6 +434,8 @@ def brats_volume_metrics_from_probs(
 
 
 def classification_metrics(logits: Tensor, target: Tensor, threshold: float = 0.5) -> dict[str, float]:
+    from sklearn.metrics import accuracy_score, average_precision_score, balanced_accuracy_score, roc_auc_score
+
     probs = torch.sigmoid(logits)
     target = target.float()
     if target.ndim == 1:
