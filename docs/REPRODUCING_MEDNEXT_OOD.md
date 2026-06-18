@@ -26,6 +26,11 @@ The row uses:
 - TC/ET-focused calibration
 - anatomical structural prior with `min_component_size=32`
 
+The canonical model package is `src/causal_mednext`. The old
+`baselines/mednext/model.py`, `baselines/mednext/causal.py`, and
+`baselines/mednext/calibration.py` files are compatibility wrappers so the
+published commands remain unchanged.
+
 ## Data
 
 Expected local paths:

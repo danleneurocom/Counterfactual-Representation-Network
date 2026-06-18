@@ -1,15 +1,17 @@
 # Causal MedNeXt
 
-This folder contains the current main architecture for the OOD brain tumor
-segmentation experiments.
+This folder contains the train/eval entry points for the OOD brain tumor
+segmentation experiments. The canonical model implementation now lives under
+`src/causal_mednext`; files in this folder keep existing commands and imports
+stable.
 
 ## Files
 
 ```text
-model.py                       3D MedNeXt encoder-decoder segmenter
-causal.py                      Causal MedNeXt wrapper and context adjustment
+model.py                       Compatibility import for causal_mednext.backbone
+causal.py                      Compatibility import for causal_mednext.causal_model
 common.py                      Shared losses, metrics, checkpoint, and TTA helpers
-calibration.py                 WT/TC/ET threshold calibration utilities
+calibration.py                 Compatibility import for calibration mechanisms
 dataset_cache.py               Optional disk cache wrapper for volume datasets
 train_utsw.py                  UTSW source baseline training
 train_causal_utsw.py           UTSW causal MedNeXt training
@@ -22,8 +24,17 @@ evaluate_causal_brats_h5.py    BraTS HDF5 causal/SCM/structural evaluation
 fit_plausibility_support.py    Optional support-fitting utility for plausibility studies
 ```
 
-The model uses `src/crn/mednext_blocks.py` for MedNeXt block primitives and
-`src/crn/metrics.py` for BraTS region and structural-prior metrics.
+The actual model is organized as:
+
+```text
+src/causal_mednext/backbone.py                    MedNeXt segmenter
+src/causal_mednext/causal_model.py                disease/context SCM wrapper
+src/causal_mednext/mechanisms/brats_hierarchy.py  WT/TC/ET hierarchy utilities
+src/causal_mednext/mechanisms/calibration.py      WT/TC/ET calibration
+src/causal_mednext/mechanisms/et_volume_veto.py   ET volume plausibility veto
+src/causal_mednext/mechanisms/structural_prior.py anatomical structural prior exports
+src/causal_mednext/mechanisms/gradient_reversal.py adversarial proxy head utility
+```
 
 ## Current Best OOD Evaluation
 
