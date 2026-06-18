@@ -11,12 +11,32 @@ from baselines.mednext.common import (
     add_common_train_args,
     build_model_from_args,
     checkpoint_config,
+    checkpoint_monitor,
+    initialize_model_from_checkpoint,
+    initialize_output_bias_from_loader,
     run_eval_epoch,
     run_train_epoch,
     save_json,
     _resolve_device,
 )
+from baselines.mednext.dataset_cache import maybe_disk_cache_dataset
 from baselines.segformer3d.train_brats_h5 import _make_dataset, _make_loader, _volume_ids
+
+
+def _cache_signature(csv_path: str | Path, args: argparse.Namespace, split: str) -> dict[str, object]:
+    return {
+        "dataset": "brats_h5",
+        "split": split,
+        "csv_path": str(csv_path),
+        "data_root": str(args.data_root),
+        "volume_size": args.volume_size,
+        "crop_margin": args.crop_margin,
+        "path_col": args.path_col,
+        "volume_col": args.volume_col,
+        "slice_col": args.slice_col,
+        "h5_image_key": args.h5_image_key,
+        "h5_mask_key": args.h5_mask_key,
+    }
 
 
 def parse_args() -> argparse.Namespace:
@@ -49,20 +69,37 @@ def main() -> None:
     save_json(splits, output_dir / "splits.json")
     save_json(checkpoint_config(args), output_dir / "config.json")
 
-    train_dataset = _make_dataset(args.train_csv, train_ids, args)
-    val_dataset = _make_dataset(args.val_csv, val_ids, args)
+    train_dataset = maybe_disk_cache_dataset(
+        _make_dataset(args.train_csv, train_ids, args),
+        args.disk_cache_dir,
+        namespace="brats_h5_train",
+        signature=_cache_signature(args.train_csv, args, "train"),
+    )
+    val_dataset = maybe_disk_cache_dataset(
+        _make_dataset(args.val_csv, val_ids, args),
+        args.disk_cache_dir,
+        namespace="brats_h5_val",
+        signature=_cache_signature(args.val_csv, args, "val"),
+    )
     train_loader = _make_loader(train_dataset, args, shuffle=True)
     val_loader = _make_loader(val_dataset, args, shuffle=False)
 
     device = _resolve_device(args.device)
     model = build_model_from_args(args).to(device)
+    init_report = initialize_model_from_checkpoint(model, args.init_checkpoint)
+    if init_report:
+        save_json(init_report, output_dir / "init_checkpoint.json")
+    bias_init = initialize_output_bias_from_loader(model, train_loader, args)
+    if bias_init:
+        save_json(bias_init, output_dir / "output_bias_init.json")
     optimizer = AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
 
-    best_dice = float("-inf")
+    best_monitor = float("-inf")
+    best_monitor_key = "brats/mean_dice"
     for epoch in range(1, args.epochs + 1):
         train_metrics = run_train_epoch(model, train_loader, optimizer, device, args, desc="mednext-brats-train")
         val_metrics = run_eval_epoch(model, val_loader, device, args, desc="mednext-brats-val")
-        monitor = float(val_metrics.get("brats/mean_dice", float("-inf")))
+        monitor, monitor_key = checkpoint_monitor(val_metrics, args)
         log = {"epoch": epoch, "train": train_metrics, "val": val_metrics}
         save_json(log, output_dir / f"epoch_{epoch:03d}.json")
         print(
@@ -71,6 +108,8 @@ def main() -> None:
                 "train_loss": train_metrics.get("loss"),
                 "val_loss": val_metrics.get("loss"),
                 "val_brats_mean_dice": val_metrics.get("brats/mean_dice"),
+                "monitor": monitor,
+                "monitor_key": monitor_key,
             }
         )
 
@@ -83,11 +122,12 @@ def main() -> None:
             "val_metrics": val_metrics,
         }
         torch.save(checkpoint, output_dir / "last.pt")
-        if monitor > best_dice:
-            best_dice = monitor
+        if monitor > best_monitor:
+            best_monitor = monitor
+            best_monitor_key = monitor_key
             torch.save(checkpoint, output_dir / "best.pt")
 
-    print({"best_val_brats_mean_dice": best_dice, "output_dir": str(output_dir)})
+    print({"best_val_monitor": best_monitor, "best_val_monitor_key": best_monitor_key, "output_dir": str(output_dir)})
 
 
 if __name__ == "__main__":

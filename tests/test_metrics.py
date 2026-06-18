@@ -8,6 +8,7 @@ from crn.metrics import (
     binary_volume_metrics_from_masks,
     brats_region_metrics,
     brats_structural_region_metrics,
+    brats_structural_region_metrics_from_thresholds,
     brats_volume_metrics_from_probs,
     classification_metrics,
     postprocess_binary_volume,
@@ -88,6 +89,26 @@ def test_brats_structural_region_metrics_removes_tiny_component_and_enforces_hie
 
     raw = brats_region_metrics(logits, target)
     structural = brats_structural_region_metrics(logits, target, threshold=0.5, min_component_size=2)
+
+    assert structural["brats/ET/dice"] > raw["brats/ET/dice"]
+    assert structural["brats/TC/dice"] > 0.99
+    assert structural["brats/WT/dice"] > 0.99
+
+
+def test_brats_structural_region_metrics_from_thresholds_uses_calibrated_regions():
+    logits = torch.full((1, 3, 8, 8, 8), -8.0)
+    target = torch.zeros((1, 3, 8, 8, 8), dtype=torch.float32)
+    logits[:, 2, 2:5, 2:5, 2:5] = 8.0
+    target[:, 2, 2:5, 2:5, 2:5] = 1.0
+    logits[:, 2, 0, 0, 0] = 8.0
+
+    raw = brats_region_metrics(logits, target)
+    structural = brats_structural_region_metrics_from_thresholds(
+        logits,
+        target,
+        {"WT": 0.5, "TC": 0.5, "ET": 0.5},
+        min_component_size=2,
+    )
 
     assert structural["brats/ET/dice"] > raw["brats/ET/dice"]
     assert structural["brats/TC/dice"] > 0.99

@@ -1,217 +1,178 @@
-# Counterfactual Representation Network
+# Causal MedNeXt for OOD Brain Tumor Segmentation
 
-## Restart Status
+This repository contains the code used for our current causal MedNeXt
+out-of-distribution brain tumor segmentation experiments. The main model is a
+3D MedNeXt segmenter augmented with a structural causal mechanism for
+context-aware segmentation, TC/ET-aware calibration, and anatomical
+region-plausibility constraints.
 
-This repository is being reset to a baseline-first causal pipeline. The first
-new milestone is a faithful SegFormer3D segmentation baseline under
-`baselines/segformer3d/`; causal components should be added only after the
-causal question, assumptions, graph, identification strategy, and estimator are
-written down. See `docs/revised_methodology.md` for the restarted Pearl-style
-pipeline.
-
-The older CRN configs, runs, and notes remain in the repo as legacy experiment
-history. Treat them as prior work, not as the new methodological mainline.
-
-Research scaffold for **Counterfactual Representation Network for Fair and Interpretable Imaging**, targeting ICDM 2026.
-
-The initial draft treated context/confounders as factors to remove from prediction. The corrected framing here follows the supervisor feedback and the identifiability / proximal-inference literature: confounders can also be causal parents of the label, so prediction should condition on both latent components while estimating the intervention effect of the disease factor — and the identifiability of that factorization requires paired/counterfactual supervision, not unsupervised disentanglement (Locatello et al. 2019).
-
-Core model:
+The current strongest verified OOD smoke result is UTSW -> BraTS:
 
 ```text
-z_d = E_d(x)
-z_c = E_c(x)
-y_hat = f_cls(z_d, z_c)
-m_hat = f_seg(z_d, z_c)
-x_hat = G(z_d, z_c)
+Mean Dice 0.792 | WT 0.852 | TC 0.820 | ET 0.703
 ```
 
-Core training idea (latent bank backdoor adjustment, reframed as proximal causal inference):
+The corresponding evaluation artifact is:
 
 ```text
-p(m | do(z_d)) ~= (1/K) sum_k p(m | z_d, z_c^(k))
+runs/_ood_causal_adapt_brats_v5_et_precision_e2/brats_val_structural_min32_metrics.json
 ```
 
-`crn.losses.backdoor_adjusted_seg_logits` averages segmentation predictions over a context bank, which plays the role of a proxy for the true unobserved context `U` in the sense of Miao–Geng–Tchetgen Tchetgen (2018) and Tchetgen Tchetgen et al. (2024). The estimator is valid under assumptions (A1)–(A5) spelled out in `docs/causal_counterfactual_framework_note.md` §4.1 (proxy structure, completeness, bridge existence, positivity, representative bank). `z_d` and `z_c` are identified *up to block-wise affine transformation* via auxiliary-variable (iVAE), content/style, and paired-intervention identifiability results. Context swapping is used as a bounded stability regularizer, not a strict invariance constraint.
+Large checkpoints, run folders, and medical imaging data are intentionally not
+tracked in git. Share checkpoints separately as artifacts.
 
-## Project Layout
+## Repository Map
 
 ```text
-configs/                  Example CheXpert and BraTS configs
-docs/                     Revised method and experiment plan
-src/crn/                  Model, losses, data loading, training entry point
-tests/                    Focused tests for the causal loss utilities
+baselines/mednext/        Main MedNeXt and causal MedNeXt implementation
+baselines/segformer3d/    Local SegFormer3D baseline and shared UTSW/BraTS loaders
+baselines/README.md       Baseline comparison and OOD baseline entry points
+scripts/                  Reproducible train/eval wrappers for the MedNeXt OOD path
+src/crn/mednext_blocks.py MedNeXt block primitives used by the local model
+src/crn/metrics.py        BraTS metrics and structural-prior evaluation utilities
+tests/                    Focused regression tests for metrics and MedNeXt plumbing
+docs/                     Reproduction notes and public-release checklist
 ```
+
+The legacy CRN prototype code is kept only where it supports the current
+MedNeXt path. The public mainline is the causal MedNeXt pipeline under
+`baselines/mednext`.
 
 ## Setup
 
 ```bash
-python3 -m venv .venv
-source .venv/bin/activate
+python3.12 -m venv .venv312
+source .venv312/bin/activate
 python -m pip install --upgrade pip
-python -m pip install ".[dev]"
+python -m pip install -e ".[dev]"
 ```
 
-Install a PyTorch build appropriate for your machine if the default dependency resolver does not choose one:
+Install the PyTorch build appropriate for your machine if needed:
 
 ```bash
 python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
 ```
 
-## Data Format
+Use `PYTHONPATH=.:src` for direct script execution.
 
-The training script expects CSV files. Minimal classification CSV:
+## Data Layout
 
-```csv
-path,Cardiomegaly,Edema,No Finding
-patient001.png,0,1,0
-patient002.png,0,0,1
+The scripts expect local datasets in these locations:
+
+```text
+data/brats/brats_train.csv
+data/brats/brats_val.csv
+data/brats/archive/BraTS2020_training_data/content/data/
+data/brats/PKG - UTSW-Glioma/UTSW-Glioma/
+data/brats/UTSW_Glioma_Metadata-2-1.tsv
 ```
 
-Minimal segmentation CSV:
+These files are ignored by git because they are large and/or dataset controlled.
 
-```csv
-path,mask,tumor_present
-case001.npy,case001_mask.npy,1
-case002.npy,case002_mask.npy,0
-```
-
-Supported image inputs are common PIL-readable images and `.npy` arrays. `.npy` arrays may be `H x W`, `H x W x C`, or `C x H x W`.
-
-For the Kaggle-style BraTS2020 HDF5 slices, prepare volume-level train/validation splits with:
+If you need to regenerate the BraTS HDF5 CSVs:
 
 ```bash
 python scripts/prepare_brats_metadata.py \
   --metadata "BraTS20 Training Metadata.csv" \
-  --data-root /Users/lenguyenlinhdan/Downloads/content/data \
+  --data-root /path/to/BraTS2020_training_data/content/data \
   --output-dir data/brats \
   --require-files
 ```
 
-This writes `data/brats/brats_train.csv` and `data/brats/brats_val.csv`. The loader expects each `.h5` file to contain `image` and `mask` keys; the current BraTS configs use `target` as the binary slice label and preserve the 3-channel tumor subregions for segmentation.
+## Reproduce The Current Best OOD Path
 
-## Run
-
-Edit the data paths in a config, then run:
-
-```bash
-PYTHONPATH=src python -m crn.train --config configs/crn_chexpert.yaml
-```
-
-or:
+The best verified OOD direction is UTSW -> BraTS. To summarize or reproduce the
+current small-sample OOD path:
 
 ```bash
-PYTHONPATH=src python -m crn.train --config configs/crn_brats.yaml
+SKIP_EXISTING=1 \
+SUMMARY_PYTHON=python3 \
+bash scripts/run_mednext_ood_et_focus_refine.sh
 ```
 
-Outputs are written to the config's `training.output_dir`.
-
-For the current strongest BraTS segmentation recipe, use:
+To evaluate the current best checkpoint with TC/ET calibration and the
+structural prior:
 
 ```bash
-PYTHONPATH=src python -m crn.train --config configs/crn_brats_segonly_unet_causal_contrastive_25d.yaml
+PYTHON_BIN=.venv312_restore/bin/python \
+CHECKPOINT=runs/_ood_causal_adapt_brats_v5_et_precision_e2/best.pt \
+OUT_JSON=runs/_ood_causal_adapt_brats_v5_et_precision_e2/brats_val_structural_min32_metrics.json \
+CONTEXT_BANK_SIZE=4 \
+CONTEXT_BANK_SAMPLING=farthest \
+MAX_CONTEXT_BANK_BATCHES=2 \
+MAX_VOLUMES=4 \
+ADJUSTMENT_CONTEXTS=2 \
+ADJUSTMENT_CONTEXT_SELECTION=diverse-nearest \
+REGION_THRESHOLDS=WT=0.65,TC=0.3,ET=0.55 \
+STRUCTURAL_PRIOR=1 \
+STRUCTURAL_THRESHOLD=0.55 \
+STRUCTURAL_MIN_COMPONENT_SIZE=32 \
+SPLIT_NAME=ood_causal_v5_et_precision_structural_min32_smoke4 \
+bash scripts/evaluate_mednext_brats_paper64_causal.sh
 ```
 
-This is the current best depth-aware causal-contrastive setup. It keeps `region_adjustment`, `region_disease_swap`, and lesion-aware contrastive learning, but replaces the planar backbone with a 2.5D slice-stack encoder/decoder. For a quick real-data sanity check before the full run, use `configs/crn_brats_segonly_unet_causal_contrastive_25d_pilot.yaml`.
+See [docs/REPRODUCING_MEDNEXT_OOD.md](docs/REPRODUCING_MEDNEXT_OOD.md) for the
+full source, adaptation, causal continuation, baseline, and reverse-direction
+commands.
 
-The previous best 2D causal-contrastive recipe is still available:
+## Baseline OOD Comparisons
+
+Source-only MedNeXt OOD baselines live under `baselines/`:
 
 ```bash
-PYTHONPATH=src python -m crn.train --config configs/crn_brats_segonly_unet_causal_contrastive_continue.yaml
+bash baselines/run_mednext_ood_baselines.sh list
+
+EXECUTE=1 MAX_VOLUMES=4 \
+bash baselines/run_mednext_ood_baselines.sh mednext utsw-to-brats
+
+EXECUTE=1 MAX_CASES=4 \
+CHECKPOINT=runs/mednext_brats_h5_s_k3_paper64/best.pt \
+bash baselines/run_mednext_ood_baselines.sh mednext brats-to-utsw
 ```
 
-If you want the stronger non-contrastive baseline instead, use `configs/crn_brats_segonly_unet_causal.yaml`. The `*_memory*.yaml` configs remain available for counterfactual-memory experiments, but they are experimental and have not beaten the current best model.
+## Qualitative Figures
 
-To try the lesion-aware counterfactual contrastive upgrade on top of the strong causal-region checkpoint, use:
+Generate structural-prior qualitative panels:
 
 ```bash
-PYTHONPATH=src python -m crn.train --config configs/crn_brats_segonly_unet_causal_contrastive.yaml
+PYTHONPATH=.:src .venv312_restore/bin/python scripts/make_mednext_structural_qual_figures.py \
+  --checkpoint runs/_ood_causal_adapt_brats_v5_et_precision_e2/best.pt \
+  --output-dir runs/figures/structural_prior_qual \
+  --max-volumes 4 \
+  --context-bank-size 4 \
+  --max-context-bank-batches 2 \
+  --adjustment-contexts 2 \
+  --adjustment-context-selection diverse-nearest \
+  --region-thresholds WT=0.65,TC=0.3,ET=0.55 \
+  --structural-min-component-size 32 \
+  --volume-size 64 \
+  --num-workers 0
 ```
 
-This adds a lesion-aware counterfactual contrastive loss with:
+## Tests
 
-- anchor: factual lesion-conditioned segmentation features
-- positive: backdoor-adjusted same-disease features
-- hard negative: matched disease-swapped counterfactual features
-
-To test which causal terms are responsible for the gain, run the matched continuation ablations:
+Focused checks for the public mainline:
 
 ```bash
-PYTHONPATH=src python -m crn.train --config configs/ablations/crn_brats_ablate_no_contrastive.yaml
-PYTHONPATH=src python -m crn.train --config configs/ablations/crn_brats_ablate_no_region_adjustment.yaml
-PYTHONPATH=src python -m crn.train --config configs/ablations/crn_brats_ablate_no_region_context_stability.yaml
-PYTHONPATH=src python -m crn.train --config configs/ablations/crn_brats_ablate_no_region_disease_swap.yaml
+PYTHONPATH=.:src python -m py_compile \
+  baselines/mednext/causal.py \
+  baselines/mednext/evaluate_causal_brats_h5.py \
+  baselines/mednext/evaluate_causal_utsw.py \
+  scripts/make_mednext_structural_qual_figures.py
+
+PYTHONPATH=.:src python -m pytest tests/test_metrics.py tests/test_mednext_baseline.py
 ```
 
-After evaluating or exporting metrics for those runs, summarize the table with:
+## Artifact Policy
 
-```bash
-python scripts/summarize_ablation_results.py --output docs/ablation_summary.md
-```
+Do not commit:
 
-For a quick BraTS sanity check before full training:
+- `data/`
+- `runs/`
+- `experiments/`
+- virtual environments
+- model checkpoints (`*.pt`, `*.ckpt`)
+- private research notes
 
-```bash
-PYTHONPATH=src python -m crn.train --config configs/crn_brats_smoke.yaml
-```
-
-To evaluate a saved checkpoint:
-
-```bash
-PYTHONPATH=src python -m crn.evaluate --checkpoint runs/brats_segonly_unet_causal_contrastive_25d/best.pt --split val --batch-size 2
-```
-
-This writes a metrics JSON next to the checkpoint, for example `runs/brats_segonly_unet_causal_contrastive_25d/best_val_metrics.json`.
-
-To run volume-level evaluation with a threshold sweep and export qualitative figures:
-
-```bash
-PYTHONPATH=src python -m crn.evaluate \
-  --checkpoint runs/brats_segonly_unet_causal_contrastive_25d/best.pt \
-  --split val \
-  --batch-size 2 \
-  --threshold-sweep 0.35,0.40,0.45,0.50,0.55,0.60,0.65 \
-  --qualitative-count 4
-```
-
-This additionally writes:
-
-- `runs/brats_segonly_unet_causal_contrastive_25d/best_val_threshold_sweep.json`
-- `runs/brats_segonly_unet_causal_contrastive_25d/best_val_qualitative/`
-
-The qualitative export saves representative best and worst validation volumes as PNG overlays together with a `summary.json` index.
-It now also exports causal counterfactual image panels for representative volumes:
-
-- factual reconstruction
-- context-swapped counterfactual image and segmentation
-- disease-swapped counterfactual image and segmentation
-- a causal disease `do`-effect map
-- a context-shift sensitivity map
-
-Volume-level evaluation now reports BraTS-style Dice and HD95 for `WT`, `TC`, and `ET`, plus per-subregion HD95.
-
-To independently tune `WT`, `TC`, and `ET` thresholds with simple 3D post-processing:
-
-```bash
-PYTHONPATH=src python -m crn.evaluate \
-  --checkpoint runs/brats_segonly_unet_causal_contrastive_25d/best.pt \
-  --split val \
-  --batch-size 2 \
-  --threshold-sweep 0.35,0.40,0.45,0.50,0.55,0.60,0.65 \
-  --tune-brats-regions \
-  --qualitative-count 4
-```
-
-This also writes `runs/brats_segonly_unet_causal_contrastive_25d/best_val_region_tuning.json` with the selected region-wise thresholds and cleanup settings.
-
-The current BraTS configs are now set up for 3-channel subregion segmentation with BraTS region metrics:
-
-- `ncr_net`
-- `edema`
-- `enhancing_tumor`
-
-and evaluation reports official derived regions:
-
-- `WT = ncr_net | edema | enhancing_tumor`
-- `TC = ncr_net | enhancing_tumor`
-- `ET = enhancing_tumor`
+For public release cleanup, see
+[docs/PUBLIC_RELEASE_CHECKLIST.md](docs/PUBLIC_RELEASE_CHECKLIST.md).

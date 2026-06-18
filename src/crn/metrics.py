@@ -355,6 +355,74 @@ def brats_structural_region_metrics(
     return summarize_metrics(items)
 
 
+def brats_structural_region_metrics_from_thresholds(
+    logits: Tensor,
+    target: Tensor,
+    thresholds: dict[str, float],
+    min_component_size: int = 16,
+    fill_holes: bool = False,
+    keep_largest: bool = False,
+    eps: float = 1e-6,
+) -> dict[str, float]:
+    """BraTS structural metrics with calibrated WT/TC/ET thresholds.
+
+    This keeps the calibrated region operating point while applying the same
+    connected-component plausibility prior as `brats_structural_region_metrics`.
+    """
+
+    if target.ndim == logits.ndim - 1:
+        target = target.unsqueeze(1)
+    probs = torch.sigmoid(logits.detach().cpu())
+    target_cpu = target.detach().cpu().float()
+    if probs.ndim != 5 or probs.shape[1] < 3:
+        raise ValueError(f"Expected logits with shape [B, 3, D, H, W], got {tuple(logits.shape)}")
+    missing = [name for name in ("WT", "TC", "ET") if name not in thresholds]
+    if missing:
+        raise ValueError(f"Missing structural region thresholds for: {', '.join(missing)}")
+
+    items: list[dict[str, float]] = []
+    for batch_idx in range(probs.shape[0]):
+        sub_probs = probs[batch_idx].numpy()
+        pred_regions = {
+            "WT": np.logical_or.reduce([sub_probs[0] >= thresholds["WT"], sub_probs[1] >= thresholds["WT"], sub_probs[2] >= thresholds["WT"]]),
+            "TC": np.logical_or(sub_probs[0] >= thresholds["TC"], sub_probs[2] >= thresholds["TC"]),
+            "ET": sub_probs[2] >= thresholds["ET"],
+        }
+        target_sub = target_cpu[batch_idx].numpy() > 0.5
+        target_regions = _enforce_brats_hierarchy(_brats_region_numpy_masks(target_sub))
+        processed = {
+            region_name: postprocess_binary_volume(
+                mask,
+                min_component_size=int(min_component_size),
+                fill_holes=bool(fill_holes),
+                keep_largest=bool(keep_largest),
+                connectivity=1,
+            )
+            for region_name, mask in pred_regions.items()
+        }
+        processed = _enforce_brats_hierarchy(processed)
+
+        item: dict[str, float] = {}
+        dice_values: list[float] = []
+        hd95_values: list[float] = []
+        for region_name in ("WT", "TC", "ET"):
+            region_metrics = binary_volume_metrics_from_masks(processed[region_name], target_regions[region_name], eps=eps)
+            prefix = f"brats/{region_name}"
+            item[f"{prefix}/dice"] = region_metrics["dice"]
+            item[f"{prefix}/iou"] = region_metrics["iou"]
+            item[f"{prefix}/precision"] = region_metrics["precision"]
+            item[f"{prefix}/recall"] = region_metrics["recall"]
+            item[f"{prefix}/pred_foreground_ratio"] = region_metrics["pred_foreground_ratio"]
+            item[f"{prefix}/target_foreground_ratio"] = region_metrics["target_foreground_ratio"]
+            item[f"{prefix}/hd95"] = region_metrics["hd95"]
+            dice_values.append(region_metrics["dice"])
+            hd95_values.append(region_metrics["hd95"])
+        item["brats/mean_dice"] = float(np.mean(dice_values))
+        item["brats/mean_hd95"] = float(np.mean(hd95_values))
+        items.append(item)
+    return summarize_metrics(items)
+
+
 def multilabel_volume_metrics_from_probs(
     probs: Tensor,
     target: Tensor,

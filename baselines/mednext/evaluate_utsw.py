@@ -9,7 +9,23 @@ import torch
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from baselines.mednext.common import load_model_for_eval, main_logits, save_json, segmentation_loss, _resolve_device
+from baselines.mednext.calibration import (
+    CALIBRATION_OBJECTIVES,
+    BratsRegionThresholdSweep,
+    brats_region_metrics_from_thresholds,
+    parse_region_thresholds,
+    parse_threshold_candidates,
+    prefix_metrics,
+)
+from baselines.mednext.common import (
+    load_model_for_eval,
+    main_logits,
+    mirror_tta_logits,
+    parse_mirror_tta_axes,
+    save_json,
+    segmentation_loss,
+    _resolve_device,
+)
 from baselines.segformer3d.data import UTSWGliomaDataset
 from baselines.segformer3d.train_utsw import _average_metric_dicts, _mean
 from baselines.segformer3d.train_causal_utsw import _prefix_metrics
@@ -50,9 +66,18 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     device = _resolve_device(args.device)
     model = load_model_for_eval(checkpoint, args).to(device)
     model.eval()
+    region_thresholds = parse_region_thresholds(args.region_thresholds)
+    calibration_candidates = parse_threshold_candidates(args.calibration_thresholds)
+    calibration_sweep = (
+        BratsRegionThresholdSweep(calibration_candidates, objective=args.calibration_objective)
+        if calibration_candidates
+        else None
+    )
+    mirror_axes = parse_mirror_tta_axes(args.mirror_tta_axes)
 
     losses: list[float] = []
     batch_metrics: list[dict[str, float]] = []
+    region_calibrated_metrics: list[dict[str, float]] = []
     structural_batch_metrics: list[dict[str, float]] = []
     volume_metrics: list[dict[str, float]] = []
     for batch_idx, batch in enumerate(tqdm(loader, desc=f"mednext-utsw-eval:{args.split}", leave=False), start=1):
@@ -61,9 +86,14 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         output = model(image)
         logits = main_logits(output)
         losses.append(float(segmentation_loss(output, target, config.get("deep_supervision_weights")).detach().cpu()))
+        logits = mirror_tta_logits(lambda augmented: main_logits(model(augmented)), image, mirror_axes, base_logits=logits)
         logits_cpu = logits.detach().cpu()
         target_cpu = target.detach().cpu()
         batch_metrics.append(brats_region_metrics(logits_cpu, target_cpu, threshold=args.threshold))
+        if region_thresholds is not None:
+            region_calibrated_metrics.append(brats_region_metrics_from_thresholds(logits_cpu, target_cpu, region_thresholds))
+        if calibration_sweep is not None:
+            calibration_sweep.update(logits_cpu, target_cpu)
         if args.structural_prior:
             structural_batch_metrics.append(
                 brats_structural_region_metrics(
@@ -97,10 +127,15 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         "checkpoint_epoch": checkpoint.get("epoch"),
         "split": args.split,
         "threshold": float(args.threshold),
+        "mirror_tta_axes": ",".join(str(axis) for axis in mirror_axes),
         "num_cases": float(len(volume_metrics)),
         "loss": _mean(losses),
     }
     metrics.update(_average_metric_dicts(batch_metrics))
+    if region_calibrated_metrics:
+        metrics.update(prefix_metrics(_average_metric_dicts(region_calibrated_metrics), "region_calibrated"))
+    if calibration_sweep is not None:
+        metrics.update(prefix_metrics(calibration_sweep.summary(), "sweep_region_calibrated"))
     if structural_batch_metrics:
         metrics.update(_prefix_metrics(_average_metric_dicts(structural_batch_metrics), "structural"))
     metrics.update({f"volume/{key}": value for key, value in _average_metric_dicts(volume_metrics).items()})
@@ -120,6 +155,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--volume-size", type=int)
     parser.add_argument("--batch-size", type=int)
     parser.add_argument("--threshold", type=float, default=0.5)
+    parser.add_argument("--region-thresholds", help="Fixed WT/TC/ET thresholds, e.g. 'WT=0.4,TC=0.5,ET=0.6'.")
+    parser.add_argument("--calibration-thresholds", help="Comma-separated WT/TC/ET threshold grid for validation-time sweep.")
+    parser.add_argument(
+        "--calibration-objective",
+        choices=CALIBRATION_OBJECTIVES,
+        default="mean",
+        help="Objective used when choosing thresholds from --calibration-thresholds.",
+    )
+    parser.add_argument("--mirror-tta-axes", help="Optional spatial mirror TTA axes: d,h,w or z,y,x.")
     parser.add_argument("--structural-prior", action="store_true")
     parser.add_argument("--structural-threshold", type=float, default=0.1)
     parser.add_argument("--structural-min-component-size", type=int, default=16)

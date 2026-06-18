@@ -1,19 +1,80 @@
-.DS_Store
+# Python / tooling
 __pycache__/
 *.py[cod]
 .pytest_cache/
 .mypy_cache/
 .ruff_cache/
-.venv/
-venv/
 *.egg-info/
 build/
 dist/
 
-data/brats/archive/
-data/brats/brats_train.csv
-data/brats/brats_val.csv
-runs/
-*.pt
-*.ckpt
+# Local environments
+/.venv/
+/.venv312/
+/.venv312_restore/
+/venv/
+.env
+.env.*
+
+# Editor / OS state
+.DS_Store
+.idea/
+.vscode/
+*.code-workspace
+
+# Medical imaging data and generated metadata
+/data/
 BraTS20 Training Metadata.csv
+*.nii
+*.nii.gz
+*.h5
+
+# Model artifacts and experiment outputs
+/runs/
+/experiments/
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.npz
+*.npy
+
+# Private notes / scratch exports
+findings.md
+research-log.md
+research-state.yaml
+/to_human/
+/paper/
+/literature/
+
+# Legacy local prototypes that are not part of the public MedNeXt OOD mainline
+/configs/
+/src/cpa_seg3d/
+src/crn/data.py
+src/crn/data_brats_africa.py
+src/crn/data_fets.py
+src/crn/eval_corruptions.py
+src/crn/eval_fets_loio.py
+src/crn/evaluate.py
+src/crn/losses.py
+src/crn/models.py
+src/crn/train.py
+src/crn/utils.py
+tests/test_cpa_seg3d.py
+tests/test_data.py
+tests/test_losses.py
+tests/test_models.py
+tests/test_segformer3d_baseline.py
+tests/test_segformer3d_brats_h5.py
+tests/test_segformer3d_causal.py
+tests/test_segformer3d_causal_visualization.py
+tests/test_segformer3d_compare.py
+tests/test_train.py
+scripts/render_markdown_pdf.py
+scripts/smoke_config.py
+scripts/summarize_ablation_results.py
+docs/ablation_summary.md
+docs/causal_counterfactual_framework_note.md
+docs/causal_counterfactual_framework_note.pdf
+docs/experiment_plan.md
+docs/revised_methodology.md

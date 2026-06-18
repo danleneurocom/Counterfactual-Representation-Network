@@ -1,6 +1,3 @@
-"""Counterfactual Representation Network package."""
+"""Shared utilities for the causal MedNeXt OOD segmentation code."""
 
-from crn.models import CounterfactualRepresentationNetwork
-
-__all__ = ["CounterfactualRepresentationNetwork"]
-
+__all__: list[str] = []

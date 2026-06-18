@@ -27,7 +27,15 @@ UTSW_DISEASE_NUMERIC_COLUMNS = ("Tumor Grade",)
 
 
 def _load_nifti(path: Path) -> np.ndarray:
+    if path.name.endswith(".gz"):
+        with path.open("rb") as handle:
+            if handle.read(2) != b"\x1f\x8b":
+                raise nib.filebasedimages.ImageFileError(f"{path} is not a gzip file")
     return np.asarray(nib.load(str(path)).dataobj)
+
+
+def _load_depth_first_nifti(path: Path) -> np.ndarray:
+    return _to_depth_first(_load_nifti(path))
 
 
 def _to_depth_first(volume: np.ndarray) -> np.ndarray:
@@ -79,37 +87,164 @@ def _resize_volume(image: np.ndarray, mask: np.ndarray, volume_size: int) -> tup
     return image_tensor.squeeze(0), mask_tensor.squeeze(0)
 
 
+def _unique_existing_paths(paths: Iterable[Path]) -> list[Path]:
+    seen: set[Path] = set()
+    existing: list[Path] = []
+    for path in paths:
+        if path in seen:
+            continue
+        seen.add(path)
+        if path.exists():
+            existing.append(path)
+    return existing
+
+
+def _modality_candidates(case_dir: Path, modality: str, ants: bool) -> list[Path]:
+    ants_name = "fl" if modality == "flair" else modality
+    ants_path = case_dir / f"brain_{ants_name}_ants.nii.gz"
+    native_paths = [
+        case_dir / f"brain_{modality}.nii.gz",
+        case_dir / f"brain_{modality.upper()}.nii.gz",
+    ]
+    paths = [ants_path, *native_paths] if ants else [*native_paths, ants_path]
+    return _unique_existing_paths(paths)
+
+
+def _segmentation_candidates(case_dir: Path, prefer_manual: bool) -> list[Path]:
+    manual_paths = [
+        case_dir / "rtumorseg_manual_correction.nii.gz",
+        case_dir / "tumorseg_manual_correction.nii.gz",
+    ]
+    fets_path = case_dir / "tumorseg_FeTS.nii.gz"
+    paths = [*manual_paths, fets_path] if prefer_manual else [fets_path, *manual_paths]
+    return _unique_existing_paths(paths)
+
+
 def _find_modality(case_dir: Path, modality: str, ants: bool) -> Path:
-    candidates = []
-    if ants:
-        ants_name = "fl" if modality == "flair" else modality
-        candidates.append(case_dir / f"brain_{ants_name}_ants.nii.gz")
-    candidates.extend(
-        [
-            case_dir / f"brain_{modality}.nii.gz",
-            case_dir / f"brain_{modality.upper()}.nii.gz",
-        ]
-    )
+    candidates = _modality_candidates(case_dir, modality, ants)
     for candidate in candidates:
-        if candidate.exists():
-            return candidate
+        return candidate
     raise FileNotFoundError(f"Missing {modality} modality in {case_dir}")
 
 
 def _find_segmentation(case_dir: Path, prefer_manual: bool) -> Path:
-    candidates = []
-    if prefer_manual:
-        candidates.extend(
-            [
-                case_dir / "rtumorseg_manual_correction.nii.gz",
-                case_dir / "tumorseg_manual_correction.nii.gz",
-            ]
-        )
-    candidates.append(case_dir / "tumorseg_FeTS.nii.gz")
+    candidates = _segmentation_candidates(case_dir, prefer_manual)
     for candidate in candidates:
-        if candidate.exists():
-            return candidate
+        return candidate
     raise FileNotFoundError(f"Missing segmentation in {case_dir}")
+
+
+def _format_load_errors(errors: list[str]) -> str:
+    return "; ".join(errors) if errors else "no candidate files were found"
+
+
+def _load_modalities(case_dir: Path, ants: bool) -> tuple[list[np.ndarray], list[Path]]:
+    candidate_lists = {modality: _modality_candidates(case_dir, modality, ants) for modality in UTSW_MODALITIES}
+
+    preferred: list[tuple[str, Path, np.ndarray]] = []
+    preferred_errors: list[str] = []
+    preloaded_by_path: dict[Path, np.ndarray] = {}
+    failed_by_path: dict[Path, str] = {}
+    for modality in UTSW_MODALITIES:
+        candidates = candidate_lists[modality]
+        if not candidates:
+            preferred_errors.append(f"{modality}: no candidate files found")
+            break
+        path = candidates[0]
+        try:
+            volume = _load_depth_first_nifti(path)
+            preloaded_by_path[path] = volume
+            preferred.append((modality, path, volume))
+        except Exception as exc:
+            error = f"{modality}/{path.name}: {type(exc).__name__}: {exc}"
+            failed_by_path[path] = error
+            preferred_errors.append(error)
+            break
+
+    if len(preferred) == len(UTSW_MODALITIES):
+        preferred_shapes = {tuple(volume.shape) for _, _, volume in preferred}
+        if len(preferred_shapes) == 1:
+            return [volume for _, _, volume in preferred], [path for _, path, _ in preferred]
+
+    loaded_by_modality: dict[str, list[tuple[int, Path, np.ndarray]]] = {}
+    load_errors: list[str] = list(preferred_errors)
+    for modality in UTSW_MODALITIES:
+        loaded: list[tuple[int, Path, np.ndarray]] = []
+        for rank, path in enumerate(candidate_lists[modality]):
+            if path in preloaded_by_path:
+                loaded.append((rank, path, preloaded_by_path[path]))
+                continue
+            if path in failed_by_path:
+                load_errors.append(failed_by_path[path])
+                continue
+            try:
+                volume = _load_depth_first_nifti(path)
+                preloaded_by_path[path] = volume
+                loaded.append((rank, path, volume))
+            except Exception as exc:
+                error = f"{modality}/{path.name}: {type(exc).__name__}: {exc}"
+                failed_by_path[path] = error
+                load_errors.append(error)
+        if not loaded:
+            raise RuntimeError(
+                f"Could not load any {modality} modality for {case_dir.name}: {_format_load_errors(load_errors)}"
+            )
+        loaded_by_modality[modality] = loaded
+
+    common_shapes: set[tuple[int, ...]] | None = None
+    for loaded in loaded_by_modality.values():
+        shapes = {tuple(volume.shape) for _, _, volume in loaded}
+        common_shapes = shapes if common_shapes is None else common_shapes & shapes
+    if not common_shapes:
+        shape_report = []
+        for modality, loaded in loaded_by_modality.items():
+            shapes = ", ".join(f"{path.name}:{tuple(volume.shape)}" for _, path, volume in loaded)
+            shape_report.append(f"{modality} [{shapes}]")
+        raise ValueError(
+            f"No common modality shape for {case_dir.name}; "
+            f"{'; '.join(shape_report)}. Load errors: {_format_load_errors(load_errors)}"
+        )
+
+    def shape_score(shape: tuple[int, ...]) -> tuple[int, tuple[int, ...]]:
+        score = 0
+        for modality in UTSW_MODALITIES:
+            ranks = [rank for rank, _, volume in loaded_by_modality[modality] if tuple(volume.shape) == shape]
+            score += min(ranks)
+        return score, shape
+
+    selected_shape = min(common_shapes, key=shape_score)
+    selected: list[tuple[Path, np.ndarray]] = []
+    for modality in UTSW_MODALITIES:
+        matches = [
+            (rank, path, volume)
+            for rank, path, volume in loaded_by_modality[modality]
+            if tuple(volume.shape) == selected_shape
+        ]
+        _, path, volume = min(matches, key=lambda item: item[0])
+        selected.append((path, volume))
+    return [volume for _, volume in selected], [path for path, _ in selected]
+
+
+def _load_segmentation(case_dir: Path, prefer_manual: bool, image_shape: tuple[int, ...]) -> tuple[np.ndarray, Path]:
+    candidates = _segmentation_candidates(case_dir, prefer_manual)
+    load_errors: list[str] = []
+    mismatched_shapes: list[str] = []
+    for path in candidates:
+        try:
+            segmentation = _load_depth_first_nifti(path)
+        except Exception as exc:
+            load_errors.append(f"{path.name}: {type(exc).__name__}: {exc}")
+            continue
+        if tuple(segmentation.shape) == tuple(image_shape):
+            return segmentation, path
+        mismatched_shapes.append(f"{path.name}:{tuple(segmentation.shape)}")
+    if not candidates:
+        raise FileNotFoundError(f"Missing segmentation in {case_dir}")
+    raise ValueError(
+        f"No segmentation for {case_dir.name} matches image shape {tuple(image_shape)}; "
+        f"mismatched shapes: {', '.join(mismatched_shapes) or 'none loaded'}. "
+        f"Load errors: {_format_load_errors(load_errors)}"
+    )
 
 
 def _clean_category(value: Any) -> str:
@@ -306,23 +441,12 @@ class UTSWGliomaDataset(Dataset):
 
     def __getitem__(self, index: int) -> dict[str, Any]:
         case_dir = self.cases[index]
-        modality_paths = [_find_modality(case_dir, modality, self.use_ants_modalities) for modality in UTSW_MODALITIES]
-        seg_path = _find_segmentation(case_dir, self.prefer_manual_seg)
-
-        volumes = [_normalize_mri(_to_depth_first(_load_nifti(path))) for path in modality_paths]
+        volumes, modality_paths = _load_modalities(case_dir, self.use_ants_modalities)
+        volumes = [_normalize_mri(volume) for volume in volumes]
         image = np.stack(volumes, axis=0)
-        segmentation = _to_depth_first(_load_nifti(seg_path))
 
         image_shape = image.shape[1:]
-        if segmentation.shape != image_shape:
-            fallback = case_dir / "tumorseg_FeTS.nii.gz"
-            if fallback.exists() and fallback != seg_path:
-                seg_path = fallback
-                segmentation = _to_depth_first(_load_nifti(seg_path))
-            if segmentation.shape != image_shape:
-                raise ValueError(
-                    f"Segmentation shape {segmentation.shape} does not match image shape {image_shape} for {case_dir.name}"
-                )
+        segmentation, seg_path = _load_segmentation(case_dir, self.prefer_manual_seg, image_shape)
 
         mask = _subregion_mask(segmentation)
         image, mask = _crop_to_foreground(image, mask, self.crop_margin)
@@ -335,6 +459,7 @@ class UTSWGliomaDataset(Dataset):
             "mask": mask_tensor,
             "source_shape": torch.tensor(image_shape, dtype=torch.long),
             "segmentation_path": str(seg_path),
+            "modality_paths": [str(path) for path in modality_paths],
         }
         if self.metadata_encoder is not None:
             item.update(self.metadata_encoder.encode(case_dir.name))

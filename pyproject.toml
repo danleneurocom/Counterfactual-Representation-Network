@@ -3,9 +3,9 @@ requires = ["setuptools>=68", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "counterfactual-representation-network"
+name = "causal-mednext-ood"
 version = "0.1.0"
-description = "Counterfactual Representation Network for fair and interpretable medical imaging."
+description = "Causal MedNeXt for out-of-distribution brain tumor segmentation."
 readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [

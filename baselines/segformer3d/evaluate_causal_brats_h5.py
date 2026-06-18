@@ -112,6 +112,58 @@ def _resize_volume(image: np.ndarray, mask: np.ndarray, volume_size: int) -> tup
     return image_tensor.squeeze(0), mask_tensor.squeeze(0).clamp(0.0, 1.0)
 
 
+def _safe_tanh(value: float) -> float:
+    return float(np.tanh(float(value)))
+
+
+def _brats_context_proxy(raw_image: np.ndarray) -> Tensor:
+    features: list[float] = []
+    for modality in range(raw_image.shape[0]):
+        values = raw_image[modality].astype(np.float32, copy=False)
+        foreground = np.abs(values) > 1e-6
+        foreground_ratio = float(foreground.mean())
+        if foreground.any():
+            observed = values[foreground]
+            mean = float(observed.mean())
+            std = float(observed.std())
+        else:
+            mean = 0.0
+            std = 0.0
+        features.extend(
+            [
+                foreground_ratio * 2.0 - 1.0,
+                _safe_tanh(mean / (std + 1e-6)),
+                _safe_tanh(np.log1p(max(std, 0.0)) / 5.0),
+            ]
+        )
+    return torch.tensor(features, dtype=torch.float32)
+
+
+def _brats_disease_proxy(mask: np.ndarray, scale: float = 1000.0) -> Tensor:
+    mask_float = (mask > 0.5).astype(np.float32, copy=False)
+    ncr_net = mask_float[0]
+    edema = mask_float[1]
+    enhancing = mask_float[2]
+    whole_tumor = np.maximum.reduce([ncr_net, edema, enhancing])
+    tumor_core = np.maximum(ncr_net, enhancing)
+    regions = [ncr_net, edema, enhancing, whole_tumor, tumor_core, enhancing]
+    features = [float(np.log1p(scale * float(region.mean()))) for region in regions]
+    return torch.tensor(features, dtype=torch.float32)
+
+
+def _brats_annotation_proxy(raw_image: np.ndarray) -> Tensor:
+    brain = np.abs(raw_image).max(axis=0) > 1e-6
+    if not brain.any():
+        return torch.zeros(4, dtype=torch.float32)
+    coords = np.argwhere(brain)
+    low = coords.min(axis=0)
+    high = coords.max(axis=0) + 1
+    shape = np.asarray(brain.shape, dtype=np.float32)
+    extent = (high - low).astype(np.float32) / np.maximum(shape, 1.0)
+    coverage = np.asarray([float(brain.mean())], dtype=np.float32)
+    return torch.tensor(np.concatenate([extent, coverage]), dtype=torch.float32)
+
+
 class BraTSH5VolumeDataset(Dataset):
     """Reconstruct BraTS2020 HDF5 slices into 3D volumes for SegFormer3D."""
 
@@ -190,6 +242,9 @@ class BraTSH5VolumeDataset(Dataset):
 
         image = np.stack(images, axis=1)
         mask = np.stack(masks, axis=1)
+        observed_context = _brats_context_proxy(image)
+        observed_disease = _brats_disease_proxy(mask)
+        observed_annotation = _brats_annotation_proxy(image)
         for modality in range(image.shape[0]):
             image[modality] = _normalize_mri(image[modality])
         original_shape = image.shape[1:]
@@ -200,6 +255,9 @@ class BraTSH5VolumeDataset(Dataset):
             "volume": volume_id,
             "image": image_tensor,
             "mask": mask_tensor,
+            "observed_context": observed_context,
+            "observed_disease": observed_disease,
+            "observed_annotation": observed_annotation,
             "source_shape": torch.tensor(original_shape, dtype=torch.long),
             "path": paths[0],
         }

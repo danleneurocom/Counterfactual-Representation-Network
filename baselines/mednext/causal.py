@@ -67,6 +67,11 @@ class CausalMedNeXt(nn.Module):
         region_causal_background_leak: float = 0.05,
         region_causal_base: str = "prior",
         region_causal_mask_source: str = "spatial",
+        region_volume_scale: float = 1000.0,
+        et_volume_veto_scale: float = 0.0,
+        et_volume_veto_multiplier: float = 4.0,
+        et_volume_veto_min_fraction: float = 5e-4,
+        et_volume_veto_max_bias: float = 4.0,
     ) -> None:
         super().__init__()
         self.latent_dim = int(latent_dim)
@@ -94,6 +99,11 @@ class CausalMedNeXt(nn.Module):
         self.nested_causal_gate_scale = min(max(0.0, float(nested_causal_gate_scale)), 1.0)
         self.region_causal_bottleneck_scale = min(max(0.0, float(region_causal_bottleneck_scale)), 1.0)
         self.region_causal_background_leak = min(max(0.0, float(region_causal_background_leak)), 1.0)
+        self.region_volume_scale = max(float(region_volume_scale), 1e-6)
+        self.et_volume_veto_scale = max(0.0, float(et_volume_veto_scale))
+        self.et_volume_veto_multiplier = max(0.0, float(et_volume_veto_multiplier))
+        self.et_volume_veto_min_fraction = min(max(0.0, float(et_volume_veto_min_fraction)), 1.0)
+        self.et_volume_veto_max_bias = max(0.0, float(et_volume_veto_max_bias))
         if region_causal_base not in {"prior", "factual"}:
             raise ValueError(f"region_causal_base must be 'prior' or 'factual', got {region_causal_base!r}")
         self.region_causal_base = str(region_causal_base)
@@ -275,6 +285,40 @@ class CausalMedNeXt(nn.Module):
         whole_tumor = 1.0 - (1.0 - ncr_net) * (1.0 - edema) * (1.0 - enhancing)
         tumor_core = 1.0 - (1.0 - ncr_net) * (1.0 - enhancing)
         return torch.cat([whole_tumor, tumor_core, enhancing], dim=1).clamp(0.0, 1.0)
+
+    def _apply_et_volume_veto(
+        self,
+        logits: Tensor,
+        region_volume_logits: Tensor | None,
+    ) -> tuple[Tensor, dict[str, Tensor]]:
+        if (
+            self.et_volume_veto_scale <= 0.0
+            or self.num_classes < 3
+            or region_volume_logits is None
+            or region_volume_logits.ndim != 2
+            or region_volume_logits.shape[1] < 3
+        ):
+            return logits, {}
+
+        et_prob = torch.sigmoid(logits[:, 2:3].detach())
+        predicted_fraction = (et_prob > 0.5).to(dtype=logits.dtype).flatten(1).mean(dim=1)
+        proxy_fraction = torch.expm1(region_volume_logits[:, 2].detach()).clamp_min(0.0)
+        proxy_fraction = (proxy_fraction / self.region_volume_scale).clamp(0.0, 1.0)
+        allowed_fraction = (proxy_fraction * self.et_volume_veto_multiplier).clamp(0.0, 1.0)
+        if self.et_volume_veto_min_fraction > 0.0:
+            allowed_fraction = allowed_fraction.clamp_min(self.et_volume_veto_min_fraction)
+        denominator = allowed_fraction.clamp_min(max(self.et_volume_veto_min_fraction, 1e-6))
+        relative_excess = ((predicted_fraction - allowed_fraction) / denominator).clamp_min(0.0)
+        bias = (self.et_volume_veto_scale * relative_excess).clamp(max=self.et_volume_veto_max_bias)
+        if bool((bias > 0).any().detach().cpu()):
+            logits = logits.clone()
+            logits[:, 2] = logits[:, 2] - bias.view(-1, 1, 1, 1)
+        return logits, {
+            "et_volume_veto_bias": bias,
+            "et_volume_veto_predicted_fraction": predicted_fraction,
+            "et_volume_veto_allowed_fraction": allowed_fraction,
+            "et_volume_proxy_fraction": proxy_fraction,
+        }
 
     @classmethod
     def _nested_condition_logits_to_outputs(
@@ -505,6 +549,8 @@ class CausalMedNeXt(nn.Module):
         calibration_bias = self.logit_calibration_scale * calibration_bias
         logits = logits * calibration_scale.view(calibration_scale.shape[0], calibration_scale.shape[1], 1, 1, 1)
         logits = logits + calibration_bias.view(calibration_bias.shape[0], calibration_bias.shape[1], 1, 1, 1)
+        region_volume_logits = self.region_volume_head(z_d) if self.region_volume_head is not None else None
+        logits, et_volume_veto_info = self._apply_et_volume_veto(logits, region_volume_logits)
         frontdoor_base_logits = logits
         base_region_prob = self._subregion_prob_to_region_prob(torch.sigmoid(frontdoor_base_logits))
         frontdoor_raw_region_logits = self._logit(base_region_prob)
@@ -641,6 +687,9 @@ class CausalMedNeXt(nn.Module):
             "modality_prior_logits": modality_prior_logits,
             "logit_calibration_scale": calibration_scale,
             "logit_calibration_bias": calibration_bias,
+            "region_volume_logits": torch.zeros(z_d.shape[0], 3, device=z_d.device, dtype=z_d.dtype)
+            if region_volume_logits is None
+            else region_volume_logits,
             "frontdoor_base_logits": frontdoor_base_logits,
             "frontdoor_raw_region_logits": frontdoor_raw_region_logits,
             "frontdoor_region_logits": frontdoor_region_logits,
@@ -665,6 +714,7 @@ class CausalMedNeXt(nn.Module):
             "causal_refiner_delta": refiner_delta,
             "causal_high_res_features": high_res_features,
         }
+        outputs.update(et_volume_veto_info)
         return outputs
 
     def segment_from_latents(self, features: Sequence[Tensor], z_d: Tensor, z_c: Tensor, image: Tensor | None = None) -> Tensor:
@@ -717,6 +767,8 @@ class CausalMedNeXt(nn.Module):
         z_d: Tensor,
         context_bank: Tensor,
         max_contexts: int | None = None,
+        anchor_context: Tensor | None = None,
+        context_selection: str = "uniform",
         image: Tensor | None = None,
     ) -> Tensor:
         if context_bank.ndim != 2:
@@ -725,8 +777,33 @@ class CausalMedNeXt(nn.Module):
             raise ValueError(f"context_bank latent dim {context_bank.shape[1]} does not match z_d dim {z_d.shape[1]}")
         bank = context_bank.to(device=z_d.device, dtype=z_d.dtype)
         if max_contexts is not None and max_contexts > 0 and bank.shape[0] > max_contexts:
-            positions = torch.linspace(0, bank.shape[0] - 1, steps=max_contexts, device=bank.device)
-            bank = bank[positions.round().long()]
+            context_count = int(max_contexts)
+            selection = str(context_selection).lower()
+            if selection == "uniform" or anchor_context is None:
+                positions = torch.linspace(0, bank.shape[0] - 1, steps=context_count, device=bank.device)
+                bank = bank[positions.round().long()]
+            else:
+                if anchor_context.ndim != 2:
+                    raise ValueError(
+                        f"anchor_context must have shape [B, latent_dim], got {tuple(anchor_context.shape)}"
+                    )
+                if anchor_context.shape[1] != bank.shape[1]:
+                    raise ValueError(
+                        f"anchor_context latent dim {anchor_context.shape[1]} does not match context_bank dim {bank.shape[1]}"
+                    )
+                anchor = anchor_context.detach().to(device=bank.device, dtype=bank.dtype)
+                distances = torch.cdist(anchor.float(), bank.float()).mean(dim=0)
+                if selection == "nearest":
+                    bank = bank[torch.topk(distances, k=context_count, largest=False, sorted=True).indices]
+                elif selection == "farthest":
+                    bank = bank[torch.topk(distances, k=context_count, largest=True, sorted=True).indices]
+                elif selection == "diverse-nearest":
+                    pool_count = min(int(bank.shape[0]), max(context_count, context_count * 4))
+                    pool = torch.topk(distances, k=pool_count, largest=False, sorted=True).indices
+                    positions = torch.linspace(0, pool_count - 1, steps=context_count, device=bank.device)
+                    bank = bank[pool[positions.round().long()]]
+                else:
+                    raise ValueError(f"Unknown context_selection mode: {context_selection!r}")
         logits = []
         for context in bank:
             z_c = context.unsqueeze(0).expand(z_d.shape[0], -1)
@@ -738,6 +815,7 @@ class CausalMedNeXt(nn.Module):
         x: Tensor,
         context_bank: Tensor | None = None,
         max_adjustment_contexts: int | None = None,
+        adjustment_context_selection: str = "uniform",
         adversary_strength: float = 1.0,
         max_contrastive_negatives: int | None = None,
     ) -> dict[str, Tensor | tuple[Tensor, ...]]:
@@ -760,6 +838,8 @@ class CausalMedNeXt(nn.Module):
                 z_d,
                 context_bank,
                 max_contexts=max_adjustment_contexts,
+                anchor_context=z_c,
+                context_selection=adjustment_context_selection,
                 image=x,
             )
         return outputs
@@ -869,6 +949,11 @@ def build_causal_mednext(
     region_causal_background_leak: float = 0.05,
     region_causal_base: str = "prior",
     region_causal_mask_source: str = "spatial",
+    region_volume_scale: float = 1000.0,
+    et_volume_veto_scale: float = 0.0,
+    et_volume_veto_multiplier: float = 4.0,
+    et_volume_veto_min_fraction: float = 5e-4,
+    et_volume_veto_max_bias: float = 4.0,
 ) -> CausalMedNeXt:
     return CausalMedNeXt(
         model_id=model_id,
@@ -903,4 +988,9 @@ def build_causal_mednext(
         region_causal_background_leak=region_causal_background_leak,
         region_causal_base=region_causal_base,
         region_causal_mask_source=region_causal_mask_source,
+        region_volume_scale=region_volume_scale,
+        et_volume_veto_scale=et_volume_veto_scale,
+        et_volume_veto_multiplier=et_volume_veto_multiplier,
+        et_volume_veto_min_fraction=et_volume_veto_min_fraction,
+        et_volume_veto_max_bias=et_volume_veto_max_bias,
     )

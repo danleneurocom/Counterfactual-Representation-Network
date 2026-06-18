@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from dataclasses import dataclass
 from dataclasses import asdict
 from pathlib import Path
@@ -10,17 +11,33 @@ from typing import Any
 import torch
 from torch import Tensor
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from tqdm import tqdm
 
+from baselines.mednext.calibration import (
+    CALIBRATION_OBJECTIVES,
+    BratsRegionThresholdSweep,
+    brats_region_probabilities,
+    brats_region_targets,
+    parse_threshold_candidates,
+    prefix_metrics,
+)
 from baselines.mednext.causal import CausalMedNeXt, build_causal_mednext
-from baselines.mednext.common import load_model_for_eval, main_logits
+from baselines.mednext.common import (
+    _parse_channel_weights,
+    checkpoint_monitor,
+    load_model_for_eval,
+    main_logits,
+    registered_modality_consistency_metrics,
+    segmentation_terms as _segmentation_terms,
+)
+from baselines.mednext.dataset_cache import maybe_disk_cache_dataset
 from baselines.segformer3d.causal import default_utsw_scm
 from baselines.segformer3d.data import UTSWGliomaDataset
 from baselines.segformer3d.train_causal_utsw import (
     _add_context_swap_outputs,
     _build_optimizer,
-    _causal_loss_terms,
+    _causal_loss_terms as _shared_causal_loss_terms,
     _float_terms,
     _load_json,
     _metadata_dims,
@@ -31,31 +48,237 @@ from baselines.segformer3d.train_causal_utsw import (
     _probability_consistency_loss,
     _require_metadata,
     _set_backbone_trainable,
-    _segmentation_terms,
     _spatial_disease_attention_loss,
     _spatial_region_head_loss,
     _subsample_context_bank,
-    _weighted_total,
+    _weighted_total as _shared_weighted_total,
 )
 from baselines.segformer3d.train_utsw import _average_metric_dicts, _case_ids, _make_splits, _resolve_device, _save_json
 from crn.metrics import brats_region_metrics
 
 
-def _make_loader(root: Path, case_ids: list[str], args: argparse.Namespace, shuffle: bool) -> DataLoader:
+def _et_volume_veto_metric_item(outputs: dict[str, Tensor | tuple[Tensor, ...]]) -> dict[str, float]:
+    bias = outputs.get("et_volume_veto_bias")
+    if not isinstance(bias, Tensor):
+        return {}
+    item = {
+        "et_volume_veto/bias_mean": float(bias.detach().mean().cpu()),
+        "et_volume_veto/bias_max": float(bias.detach().max().cpu()),
+        "et_volume_veto/active_fraction": float((bias.detach() > 0).float().mean().cpu()),
+    }
+    for key, name in (
+        ("et_volume_veto_predicted_fraction", "predicted_fraction"),
+        ("et_volume_veto_allowed_fraction", "allowed_fraction"),
+        ("et_volume_proxy_fraction", "proxy_fraction"),
+    ):
+        value = outputs.get(key)
+        if isinstance(value, Tensor):
+            item[f"et_volume_veto/{name}_mean"] = float(value.detach().mean().cpu())
+    return item
+
+
+def _et_volume_veto_scale_for_epoch(args: argparse.Namespace, epoch: int) -> float:
+    target = max(0.0, float(getattr(args, "et_volume_veto_scale", 0.0)))
+    if target <= 0.0:
+        return 0.0
+    warmup_epochs = max(0, int(getattr(args, "et_volume_veto_warmup_epochs", 0)))
+    if int(epoch) <= warmup_epochs:
+        return 0.0
+    ramp_epochs = max(0, int(getattr(args, "et_volume_veto_ramp_epochs", 0)))
+    if ramp_epochs <= 0:
+        return target
+    progress = min(max(int(epoch) - warmup_epochs, 0), ramp_epochs) / float(ramp_epochs)
+    return target * progress
+
+
+def _set_et_volume_veto_scale_for_epoch(model: CausalMedNeXt, args: argparse.Namespace, epoch: int) -> float:
+    scale = _et_volume_veto_scale_for_epoch(args, epoch)
+    model.et_volume_veto_scale = scale
+    return scale
+
+
+class RegisteredModalityPairDataset(Dataset):
+    """Adds the opposite native/ANTs image for the same UTSW case."""
+
+    def __init__(self, primary: Dataset, registered: Dataset) -> None:
+        if len(primary) != len(registered):
+            raise ValueError(f"Registered modality pair length mismatch: {len(primary)} vs {len(registered)}")
+        self.primary = primary
+        self.registered = registered
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self.primary, name)
+
+    def __len__(self) -> int:
+        return len(self.primary)
+
+    def __getitem__(self, index: int) -> dict[str, Any]:
+        item = dict(self.primary[index])
+        registered_item = self.registered[index]
+        primary_case = item.get("case_id")
+        registered_case = registered_item.get("case_id") if isinstance(registered_item, dict) else None
+        if primary_case != registered_case:
+            raise ValueError(f"Registered modality pair case mismatch at {index}: {primary_case!r} vs {registered_case!r}")
+        item["registered_image"] = registered_item["image"]
+        item["registered_case_id"] = registered_case
+        return item
+
+
+def _small_lesion_emphasis_weights(
+    target: Tensor,
+    *,
+    emphasis: float,
+    reference_fractions: str,
+    region_weights: str,
+    max_weight: float,
+    reference_name: str,
+    region_weights_name: str,
+) -> Tensor:
+    dtype = target.dtype if target.is_floating_point() else torch.float32
+    if float(emphasis) <= 0.0:
+        return torch.ones((), device=target.device, dtype=dtype)
+    if target.ndim == 4:
+        target = target.unsqueeze(0)
+    target = target.to(dtype=dtype)
+    references = _parse_channel_weights(reference_fractions, 3, reference_name)
+    weights = _parse_channel_weights(region_weights, 3, region_weights_name)
+    region_target = brats_region_targets(target).to(device=target.device, dtype=dtype)
+    region_volume = region_target.mean(dim=tuple(range(2, region_target.ndim)))
+    reference_tensor = torch.as_tensor(references, device=target.device, dtype=dtype).clamp_min(1e-6)
+    region_weight = torch.as_tensor(weights, device=target.device, dtype=dtype).clamp_min(0.0)
+    rarity = ((reference_tensor.view(1, 3) - region_volume).clamp_min(0.0) / reference_tensor.view(1, 3)).clamp(0.0, 1.0)
+    rarity_score = (rarity * region_weight.view(1, 3)).sum(dim=1).div(region_weight.sum().clamp_min(1e-6))
+    non_empty = (region_volume[:, 0] > 0.0).to(dtype=dtype)
+    weight = 1.0 + float(emphasis) * rarity_score * non_empty
+    return weight.clamp(1.0, max(1.0, float(max_weight))).detach()
+
+
+def _make_utsw_dataset(
+    root: Path,
+    case_ids: list[str],
+    args: argparse.Namespace,
+    cache_name: str,
+    *,
+    use_ants_modalities: bool,
+    cache_suffix: str = "",
+) -> Dataset:
     dataset = UTSWGliomaDataset(
         root=root,
         volume_size=args.volume_size,
         case_ids=case_ids,
         crop_margin=args.crop_margin,
         prefer_manual_seg=args.prefer_manual_seg,
-        use_ants_modalities=args.use_ants_modalities,
+        use_ants_modalities=use_ants_modalities,
         metadata_path=args.metadata_path,
         include_metadata=True,
     )
+    return maybe_disk_cache_dataset(
+        dataset,
+        args.disk_cache_dir,
+        namespace=f"utsw_causal_{cache_name}{cache_suffix}",
+        signature={
+            "dataset": "utsw_causal",
+            "split": cache_name,
+            "root": str(root),
+            "volume_size": args.volume_size,
+            "crop_margin": args.crop_margin,
+            "prefer_manual_seg": args.prefer_manual_seg,
+            "use_ants_modalities": use_ants_modalities,
+            "metadata_path": args.metadata_path,
+            "include_metadata": True,
+        },
+    )
+
+
+def _uses_registered_modality_training(args: argparse.Namespace) -> bool:
+    return any(
+        float(getattr(args, name, 0.0)) > 0.0
+        for name in (
+            "lambda_registered_modality_seg",
+            "lambda_registered_modality_consistency",
+            "lambda_registered_modality_region_consistency",
+            "lambda_registered_modality_wt_consistency",
+            "lambda_registered_modality_fusion_seg",
+            "lambda_registered_modality_view_advantage_distillation",
+            "lambda_registered_modality_disease_invariance",
+        )
+    )
+
+
+def _uses_registered_modality_validation(args: argparse.Namespace) -> bool:
+    return bool(getattr(args, "checkpoint_registered_modality_tta", False))
+
+
+def _hard_case_sampler_weights(dataset: Dataset, args: argparse.Namespace) -> Tensor | None:
+    emphasis = float(getattr(args, "hard_case_sampler_emphasis", 0.0) or 0.0)
+    if emphasis <= 0.0:
+        return None
+    source = dataset.primary if isinstance(dataset, RegisteredModalityPairDataset) else dataset
+    weights: list[float] = []
+    for index in range(len(source)):
+        item = source[index]
+        target = item["mask"]
+        if not isinstance(target, Tensor):
+            raise TypeError(f"Expected tensor mask for hard-case sampler at index {index}, got {type(target).__name__}")
+        weight = _small_lesion_emphasis_weights(
+            target,
+            emphasis=emphasis,
+            reference_fractions=getattr(args, "hard_case_sampler_reference_fractions", "0.015,0.006,0.003"),
+            region_weights=getattr(args, "hard_case_sampler_region_weights", "0.5,1.0,1.5"),
+            max_weight=float(getattr(args, "hard_case_sampler_max_weight", 3.0) or 3.0),
+            reference_name="--hard-case-sampler-reference-fractions",
+            region_weights_name="--hard-case-sampler-region-weights",
+        )
+        weights.append(float(weight.mean().cpu()))
+    if not weights:
+        return None
+    return torch.as_tensor(weights, dtype=torch.double).clamp_min(1e-6)
+
+
+def _hard_case_sampler(dataset: Dataset, args: argparse.Namespace) -> WeightedRandomSampler | None:
+    weights = _hard_case_sampler_weights(dataset, args)
+    if weights is None:
+        return None
+    multiplier = max(float(getattr(args, "hard_case_sampler_epoch_multiplier", 1.0) or 1.0), 1e-6)
+    num_samples = max(1, int(round(len(weights) * multiplier)))
+    generator = torch.Generator()
+    generator.manual_seed(int(getattr(args, "seed", 7)))
+    return WeightedRandomSampler(weights, num_samples=num_samples, replacement=True, generator=generator)
+
+
+def _make_loader(
+    root: Path,
+    case_ids: list[str],
+    args: argparse.Namespace,
+    shuffle: bool,
+    cache_name: str,
+    *,
+    registered_modality_pair: bool = False,
+) -> DataLoader:
+    dataset = _make_utsw_dataset(
+        root,
+        case_ids,
+        args,
+        cache_name,
+        use_ants_modalities=args.use_ants_modalities,
+    )
+    if registered_modality_pair:
+        registered_source = "native" if args.use_ants_modalities else "ants"
+        registered_dataset = _make_utsw_dataset(
+            root,
+            case_ids,
+            args,
+            cache_name,
+            use_ants_modalities=not args.use_ants_modalities,
+            cache_suffix=f"_registered_{registered_source}",
+        )
+        dataset = RegisteredModalityPairDataset(dataset, registered_dataset)
+    sampler = _hard_case_sampler(dataset, args) if shuffle else None
     return DataLoader(
         dataset,
         batch_size=args.batch_size,
-        shuffle=shuffle,
+        shuffle=shuffle if sampler is None else False,
+        sampler=sampler,
         num_workers=args.num_workers,
         pin_memory=args.pin_memory,
     )
@@ -103,6 +326,11 @@ def _build_model_from_dataset(args: argparse.Namespace, dataset: UTSWGliomaDatas
         region_causal_background_leak=args.region_causal_background_leak,
         region_causal_base=args.region_causal_base,
         region_causal_mask_source=args.region_causal_mask_source,
+        region_volume_scale=args.region_volume_scale,
+        et_volume_veto_scale=args.et_volume_veto_scale,
+        et_volume_veto_multiplier=args.et_volume_veto_multiplier,
+        et_volume_veto_min_fraction=args.et_volume_veto_min_fraction,
+        et_volume_veto_max_bias=args.et_volume_veto_max_bias,
         treatment_proxy_dim=treatment_proxy_dim,
         **_metadata_dims(dataset),
     )
@@ -113,6 +341,19 @@ def _load_baseline_backbone(model: CausalMedNeXt, checkpoint_path: Path) -> dict
     state_dict = checkpoint.get("model", checkpoint)
     model.load_baseline_state_dict(state_dict, strict_backbone=True)
     return checkpoint
+
+
+def _load_causal_init_checkpoint(model: CausalMedNeXt, checkpoint_path: str | Path | None) -> dict[str, Any]:
+    if not checkpoint_path:
+        return {}
+    path = Path(checkpoint_path).expanduser()
+    checkpoint = torch.load(path, map_location="cpu")
+    state_dict = checkpoint.get("model", checkpoint)
+    report = model.load_compatible_state_dict(state_dict)
+    report["checkpoint"] = str(path)
+    report["epoch"] = checkpoint.get("epoch") if isinstance(checkpoint, dict) else None
+    report["loaded_keys"] = len(state_dict) - len(report["unexpected_keys"]) - len(report["skipped_shape_keys"])
+    return report
 
 
 def _build_teacher_model(checkpoint_path: str | Path | None, device: torch.device) -> torch.nn.Module | None:
@@ -133,6 +374,26 @@ def _teacher_logits(teacher: torch.nn.Module | None, image: Tensor) -> Tensor | 
     if teacher is None:
         return None
     return main_logits(teacher(image)).detach()
+
+
+def _causal_loss_terms(
+    outputs: dict[str, Tensor | tuple[Tensor, ...]],
+    batch: dict[str, Any],
+    args: argparse.Namespace,
+    proxy_layout: dict[str, list[dict[str, Any]]] | None,
+) -> dict[str, Tensor]:
+    """Use the shared causal objective with MedNeXt-local segmentation terms."""
+
+    shared_globals = _shared_causal_loss_terms.__globals__
+    original_segmentation_terms = shared_globals.get("_segmentation_terms")
+    shared_globals["_segmentation_terms"] = _segmentation_terms
+    try:
+        return _shared_causal_loss_terms(outputs, batch, args, proxy_layout)
+    finally:
+        if original_segmentation_terms is None:
+            shared_globals.pop("_segmentation_terms", None)
+        else:
+            shared_globals["_segmentation_terms"] = original_segmentation_terms
 
 
 def _parse_float_range(spec: str, name: str) -> tuple[float, float]:
@@ -576,6 +837,320 @@ def _feature_intervention_terms(
     return terms
 
 
+def _registered_modality_terms(
+    outputs: dict[str, Tensor | tuple[Tensor, ...]],
+    registered_outputs: dict[str, Tensor | tuple[Tensor, ...]],
+    target: Tensor,
+    args: argparse.Namespace,
+) -> dict[str, Tensor]:
+    terms: dict[str, Tensor] = {}
+    registered_logits = registered_outputs.get("logits")
+    factual_logits = outputs.get("logits")
+    if isinstance(registered_logits, Tensor) and float(args.lambda_registered_modality_seg) > 0.0:
+        seg_terms = _segmentation_terms(
+            registered_logits,
+            target,
+            _registered_segmentation_args(args),
+            "registered_modality_seg",
+        )
+        registered_seg_weight = _registered_modality_small_lesion_weight(target, args)
+        if isinstance(factual_logits, Tensor):
+            registered_seg_weight = registered_seg_weight * _registered_modality_error_weight(
+                factual_logits,
+                target,
+                args,
+            )
+        for name in ("registered_modality_seg", "registered_modality_seg_region"):
+            if name in seg_terms:
+                seg_terms[name] = seg_terms[name] * registered_seg_weight
+        terms.update(seg_terms)
+    if (
+        isinstance(registered_logits, Tensor)
+        and isinstance(factual_logits, Tensor)
+        and float(getattr(args, "lambda_registered_modality_fusion_seg", 0.0)) > 0.0
+    ):
+        fusion_logits = _fuse_registered_modality_logits(
+            factual_logits,
+            registered_logits,
+            str(getattr(args, "registered_modality_fusion_mode", "mean-probs")),
+        )
+        fusion_terms = _segmentation_terms(
+            fusion_logits,
+            target,
+            _registered_segmentation_args(args),
+            "registered_modality_fusion_seg",
+        )
+        fusion_seg_weight = _registered_modality_small_lesion_weight(target, args) * _registered_modality_error_weight(
+            factual_logits,
+            target,
+            args,
+        )
+        for name in ("registered_modality_fusion_seg", "registered_modality_fusion_seg_region"):
+            if name in fusion_terms:
+                fusion_terms[name] = fusion_terms[name] * fusion_seg_weight
+        terms.update(fusion_terms)
+    if (
+        isinstance(registered_logits, Tensor)
+        and isinstance(factual_logits, Tensor)
+        and float(args.lambda_registered_modality_consistency) > 0.0
+    ):
+        terms["registered_modality_consistency"] = _probability_consistency_loss(
+            registered_logits,
+            factual_logits,
+            args,
+        )
+    if (
+        isinstance(registered_logits, Tensor)
+        and isinstance(factual_logits, Tensor)
+        and float(getattr(args, "lambda_registered_modality_region_consistency", 0.0)) > 0.0
+    ):
+        weights = _parse_channel_weights(
+            getattr(args, "registered_modality_region_consistency_weights", "1.0,1.5,2.5"),
+            3,
+            "--registered-modality-region-consistency-weights",
+        )
+        registered_regions = brats_region_probabilities(registered_logits)
+        factual_regions = brats_region_probabilities(factual_logits.detach())
+        region_delta = (registered_regions - factual_regions).pow(2)
+        region_weights = torch.as_tensor(weights, device=region_delta.device, dtype=region_delta.dtype)
+        terms["registered_modality_region_consistency"] = (
+            region_delta * region_weights.view(1, 3, 1, 1, 1)
+        ).sum(dim=1).div(region_weights.sum().clamp_min(1e-6)).mean()
+    if (
+        isinstance(registered_logits, Tensor)
+        and isinstance(factual_logits, Tensor)
+        and float(getattr(args, "lambda_registered_modality_wt_consistency", 0.0)) > 0.0
+    ):
+        registered_wt = brats_region_probabilities(registered_logits)[:, :1]
+        factual_wt = brats_region_probabilities(factual_logits.detach())[:, :1]
+        dims = tuple(range(2, registered_wt.ndim))
+        intersection = (registered_wt * factual_wt).sum(dim=dims)
+        denominator = registered_wt.sum(dim=dims) + factual_wt.sum(dim=dims)
+        dice = (2.0 * intersection + 1e-6) / (denominator + 1e-6)
+        terms["registered_modality_wt_consistency"] = (1.0 - dice).mean()
+    if (
+        isinstance(registered_logits, Tensor)
+        and isinstance(factual_logits, Tensor)
+        and float(getattr(args, "lambda_registered_modality_view_advantage_distillation", 0.0)) > 0.0
+    ):
+        terms["registered_modality_view_advantage_distillation"] = (
+            _registered_modality_view_advantage_distillation_loss(
+                factual_logits,
+                registered_logits,
+                target,
+                args,
+            )
+        )
+    z_d = outputs.get("z_d")
+    registered_z_d = registered_outputs.get("z_d")
+    if (
+        isinstance(z_d, Tensor)
+        and isinstance(registered_z_d, Tensor)
+        and float(args.lambda_registered_modality_disease_invariance) > 0.0
+    ):
+        terms["registered_modality_disease_invariance"] = F.mse_loss(
+            F.normalize(registered_z_d, dim=1),
+            F.normalize(z_d.detach(), dim=1),
+        )
+    return terms
+
+
+def _registered_modality_small_lesion_weight(target: Tensor, args: argparse.Namespace) -> Tensor:
+    emphasis = float(getattr(args, "registered_modality_small_lesion_emphasis", 0.0) or 0.0)
+    return _small_lesion_emphasis_weights(
+        target,
+        emphasis=emphasis,
+        reference_fractions=getattr(args, "registered_modality_small_lesion_reference_fractions", "0.015,0.006,0.003"),
+        region_weights=getattr(args, "registered_modality_small_lesion_region_weights", "0.5,1.0,1.5"),
+        max_weight=float(getattr(args, "registered_modality_small_lesion_max_weight", 2.0) or 2.0),
+        reference_name="--registered-modality-small-lesion-reference-fractions",
+        region_weights_name="--registered-modality-small-lesion-region-weights",
+    ).mean()
+
+
+def _registered_modality_error_weight(factual_logits: Tensor, target: Tensor, args: argparse.Namespace) -> Tensor:
+    emphasis = float(getattr(args, "registered_modality_error_emphasis", 0.0) or 0.0)
+    if emphasis <= 0.0:
+        return torch.ones((), device=factual_logits.device, dtype=factual_logits.dtype)
+    weights = _parse_channel_weights(
+        getattr(args, "registered_modality_error_region_weights", "0.3,1.0,1.5"),
+        3,
+        "--registered-modality-error-region-weights",
+    )
+    region_probs = brats_region_probabilities(factual_logits.detach())
+    region_target = brats_region_targets(target).to(device=region_probs.device, dtype=region_probs.dtype)
+    dims = tuple(range(2, region_probs.ndim))
+    intersection = (region_probs * region_target).sum(dim=dims)
+    denominator = region_probs.sum(dim=dims) + region_target.sum(dim=dims)
+    dice = (2.0 * intersection + 1e-6) / (denominator + 1e-6)
+    present = (region_target.sum(dim=dims) > 0.0).to(dtype=region_probs.dtype)
+    region_weight = torch.as_tensor(weights, device=region_probs.device, dtype=region_probs.dtype).clamp_min(0.0)
+    numerator = ((1.0 - dice).clamp(0.0, 1.0) * present * region_weight.view(1, 3)).sum(dim=1)
+    weight_sum = (present * region_weight.view(1, 3)).sum(dim=1).clamp_min(1e-6)
+    error_score = (numerator / weight_sum).mean()
+    max_weight = max(1.0, float(getattr(args, "registered_modality_error_max_weight", 1.5) or 1.5))
+    return (1.0 + emphasis * error_score).clamp(1.0, max_weight).detach()
+
+
+def _soft_region_dice(region_probs: Tensor, region_target: Tensor, eps: float = 1e-6) -> Tensor:
+    dims = tuple(range(2, region_probs.ndim))
+    intersection = (region_probs * region_target).sum(dim=dims)
+    denominator = region_probs.sum(dim=dims) + region_target.sum(dim=dims)
+    return (2.0 * intersection + eps) / (denominator + eps)
+
+
+def _registered_modality_view_advantage_distillation_loss(
+    factual_logits: Tensor,
+    registered_logits: Tensor,
+    target: Tensor,
+    args: argparse.Namespace,
+) -> Tensor:
+    weights = _parse_channel_weights(
+        getattr(args, "registered_modality_view_advantage_region_weights", "0.25,1.0,1.5"),
+        3,
+        "--registered-modality-view-advantage-region-weights",
+    )
+    margin = max(0.0, float(getattr(args, "registered_modality_view_advantage_margin", 0.0) or 0.0))
+    factual_regions = brats_region_probabilities(factual_logits)
+    registered_regions = brats_region_probabilities(registered_logits)
+    region_target = brats_region_targets(target).to(device=factual_regions.device, dtype=factual_regions.dtype)
+    factual_dice = _soft_region_dice(factual_regions.detach(), region_target)
+    registered_dice = _soft_region_dice(registered_regions.detach(), region_target)
+    factual_better = (factual_dice > registered_dice + margin).to(dtype=factual_regions.dtype)
+    registered_better = (registered_dice > factual_dice + margin).to(dtype=factual_regions.dtype)
+    dims = tuple(range(2, factual_regions.ndim))
+    factual_student_loss = (factual_regions - registered_regions.detach()).square().mean(dim=dims)
+    registered_student_loss = (registered_regions - factual_regions.detach()).square().mean(dim=dims)
+    per_region_loss = registered_better * factual_student_loss + factual_better * registered_student_loss
+    region_weights = torch.as_tensor(weights, device=factual_regions.device, dtype=factual_regions.dtype).clamp_min(0.0)
+    active_weights = (registered_better + factual_better).clamp_max(1.0) * region_weights.view(1, 3)
+    numerator = (per_region_loss * region_weights.view(1, 3)).sum(dim=1)
+    denominator = active_weights.sum(dim=1).clamp_min(1e-6)
+    return (numerator / denominator).mean()
+
+
+def _registered_segmentation_args(args: argparse.Namespace) -> argparse.Namespace:
+    channel_weights = _scheduled_registered_weight_spec(
+        args,
+        target_attr="registered_modality_channel_loss_weights",
+        start_attr="registered_modality_start_channel_loss_weights",
+        base_attr="channel_loss_weights",
+        count=3,
+        name="--registered-modality-channel-loss-weights",
+    )
+    region_weights = _scheduled_registered_weight_spec(
+        args,
+        target_attr="registered_modality_region_loss_weights",
+        start_attr="registered_modality_start_region_loss_weights",
+        base_attr="region_loss_weights",
+        count=3,
+        name="--registered-modality-region-loss-weights",
+    )
+    if not channel_weights and not region_weights:
+        return args
+    registered_args = copy.copy(args)
+    if channel_weights:
+        setattr(registered_args, "channel_loss_weights", channel_weights)
+    if region_weights:
+        setattr(registered_args, "region_loss_weights", region_weights)
+    return registered_args
+
+
+def _registered_modality_weight_schedule_alpha(args: argparse.Namespace, epoch: int | None = None) -> float:
+    has_scheduled_target = bool(
+        str(getattr(args, "registered_modality_channel_loss_weights", "") or "").strip()
+        or str(getattr(args, "registered_modality_region_loss_weights", "") or "").strip()
+    )
+    if not has_scheduled_target:
+        return 0.0
+    ramp_epochs = int(getattr(args, "registered_modality_weight_ramp_epochs", 0) or 0)
+    if ramp_epochs <= 0:
+        return 1.0
+    current_epoch = int(epoch if epoch is not None else getattr(args, "_current_epoch", 1))
+    if ramp_epochs <= 1:
+        return 1.0
+    return float(min(max((current_epoch - 1) / max(ramp_epochs - 1, 1), 0.0), 1.0))
+
+
+def _format_weight_spec(weights: tuple[float, ...]) -> str:
+    return ",".join(f"{weight:.6g}" for weight in weights)
+
+
+def _scheduled_registered_weight_spec(
+    args: argparse.Namespace,
+    *,
+    target_attr: str,
+    start_attr: str,
+    base_attr: str,
+    count: int,
+    name: str,
+) -> str:
+    target_spec = str(getattr(args, target_attr, "") or "").strip()
+    if not target_spec:
+        return ""
+    ramp_epochs = int(getattr(args, "registered_modality_weight_ramp_epochs", 0) or 0)
+    if ramp_epochs <= 0:
+        return target_spec
+    target = _parse_channel_weights(target_spec, count, name)
+    start_spec = str(getattr(args, start_attr, "") or "").strip()
+    if not start_spec:
+        start_spec = str(getattr(args, base_attr, "1.0,1.0,1.0") or "")
+    start = _parse_channel_weights(start_spec, count, f"--{start_attr.replace('_', '-')}")
+    alpha = _registered_modality_weight_schedule_alpha(args)
+    scheduled = tuple((1.0 - alpha) * left + alpha * right for left, right in zip(start, target, strict=True))
+    return _format_weight_spec(scheduled)
+
+
+def _logit(probability: Tensor) -> Tensor:
+    return torch.logit(probability.clamp(1e-4, 1.0 - 1e-4))
+
+
+def _fuse_registered_modality_logits(native_logits: Tensor, registered_logits: Tensor, fusion: str) -> Tensor:
+    if fusion == "mean-logits":
+        return 0.5 * (native_logits + registered_logits)
+    native_prob = torch.sigmoid(native_logits)
+    registered_prob = torch.sigmoid(registered_logits)
+    if fusion == "mean-probs":
+        return _logit(0.5 * (native_prob + registered_prob))
+    if fusion == "max-probs":
+        return _logit(torch.maximum(native_prob, registered_prob))
+    if fusion == "registered-only":
+        return registered_logits
+    raise ValueError(f"Unsupported registered modality fusion: {fusion}")
+
+
+def _registered_modality_loss_weight(name: str, args: argparse.Namespace) -> float:
+    if name in {"registered_modality_seg", "registered_modality_seg_region"}:
+        return float(getattr(args, "lambda_registered_modality_seg", 0.0))
+    if name in {"registered_modality_fusion_seg", "registered_modality_fusion_seg_region"}:
+        return float(getattr(args, "lambda_registered_modality_fusion_seg", 0.0))
+    if name == "registered_modality_consistency":
+        return float(getattr(args, "lambda_registered_modality_consistency", 0.0))
+    if name == "registered_modality_region_consistency":
+        return float(getattr(args, "lambda_registered_modality_region_consistency", 0.0))
+    if name == "registered_modality_wt_consistency":
+        return float(getattr(args, "lambda_registered_modality_wt_consistency", 0.0))
+    if name == "registered_modality_view_advantage_distillation":
+        return float(getattr(args, "lambda_registered_modality_view_advantage_distillation", 0.0))
+    if name == "registered_modality_disease_invariance":
+        return float(getattr(args, "lambda_registered_modality_disease_invariance", 0.0))
+    return 0.0
+
+
+def _weighted_total(terms: dict[str, Tensor], args: argparse.Namespace) -> Tensor:
+    registered_terms = {
+        name: value for name, value in terms.items() if name.startswith("registered_modality_")
+    }
+    base_terms = {
+        name: value for name, value in terms.items() if name not in registered_terms
+    }
+    first_value = next(iter(terms.values()))
+    total = _shared_weighted_total(base_terms, args) if base_terms else torch.zeros((), device=first_value.device)
+    for name, value in registered_terms.items():
+        total = total + _registered_modality_loss_weight(name, args) * value
+    return total
+
+
 @torch.no_grad()
 def prefill_lesion_intervention_bank(
     bank: LesionInterventionBank | None,
@@ -727,6 +1302,7 @@ def _run_train_epoch(
             image,
             context_bank=bank_device,
             max_adjustment_contexts=args.adjustment_contexts,
+            adjustment_context_selection=args.adjustment_context_selection,
             adversary_strength=args.adversary_strength,
             max_contrastive_negatives=args.cite_bank_negatives,
         )
@@ -736,6 +1312,16 @@ def _run_train_epoch(
         if teacher_logits is not None:
             outputs["teacher_logits"] = teacher_logits
         terms = _causal_loss_terms(outputs, batch, args, proxy_layout)
+        registered_outputs = None
+        registered_image = batch.get("registered_image")
+        if isinstance(registered_image, Tensor) and _uses_registered_modality_training(args):
+            registered_outputs = model(
+                registered_image.to(device),
+                context_bank=None,
+                adversary_strength=args.adversary_strength,
+                max_contrastive_negatives=args.cite_bank_negatives,
+            )
+            terms.update(_registered_modality_terms(outputs, registered_outputs, target, args))
         if _should_apply_style_intervention(args):
             style_image = apply_style_intervention(image, args)
             style_outputs = model(
@@ -807,6 +1393,14 @@ def _run_train_epoch(
             metrics.update(_prefix_metrics(brats_region_metrics(outputs["adjusted_logits"].detach().cpu(), target.detach().cpu(), threshold=args.threshold), "adjusted"))
         if "context_swap_logits" in outputs:
             metrics.update(_prefix_metrics(brats_region_metrics(outputs["context_swap_logits"].detach().cpu(), target.detach().cpu(), threshold=args.threshold), "context_swap"))
+        if registered_outputs is not None and isinstance(registered_outputs.get("logits"), Tensor):
+            metrics.update(
+                _prefix_metrics(
+                    brats_region_metrics(registered_outputs["logits"].detach().cpu(), target.detach().cpu(), threshold=args.threshold),
+                    "registered_modality",
+                )
+            )
+        metrics.update(_et_volume_veto_metric_item(outputs))
         metric_items.append(metrics)
         if lesion_bank is not None:
             lesion_bank.update(image, target)
@@ -828,6 +1422,32 @@ def _run_eval_epoch(
     model.eval()
     loss_logs: list[dict[str, float]] = []
     metric_items: list[dict[str, float]] = []
+    adjusted_metric_items: list[dict[str, float]] = []
+    calibration_candidates = parse_threshold_candidates(getattr(args, "checkpoint_calibration_thresholds", None))
+    calibration_sweep = (
+        BratsRegionThresholdSweep(
+            calibration_candidates,
+            objective=getattr(args, "checkpoint_calibration_objective", "mean"),
+        )
+        if calibration_candidates
+        else None
+    )
+    adjusted_calibration_sweep = (
+        BratsRegionThresholdSweep(
+            calibration_candidates,
+            objective=getattr(args, "checkpoint_calibration_objective", "mean"),
+        )
+        if calibration_candidates
+        else None
+    )
+    registered_tta_calibration_sweep = (
+        BratsRegionThresholdSweep(
+            calibration_candidates,
+            objective=getattr(args, "checkpoint_calibration_objective", "mean"),
+        )
+        if calibration_candidates
+        else None
+    )
     bank_device = context_bank.to(device) if context_bank is not None else None
     for batch_idx, batch in enumerate(tqdm(loader, desc="mednext-causal-val", leave=False), start=1):
         image = batch["image"].to(device)
@@ -836,6 +1456,7 @@ def _run_eval_epoch(
             image,
             context_bank=bank_device,
             max_adjustment_contexts=args.adjustment_contexts,
+            adjustment_context_selection=args.adjustment_context_selection,
             adversary_strength=args.adversary_strength,
             max_contrastive_negatives=args.cite_bank_negatives,
         )
@@ -847,24 +1468,101 @@ def _run_eval_epoch(
         item = {"loss/total": float(total.detach().cpu())}
         item.update(_float_terms(terms))
         loss_logs.append(item)
-        metrics = brats_region_metrics(outputs["logits"].detach().cpu(), target.detach().cpu(), threshold=args.threshold)
+        logits_cpu = outputs["logits"].detach().cpu()
+        target_cpu = target.detach().cpu()
+        metrics = brats_region_metrics(logits_cpu, target_cpu, threshold=args.threshold)
+        if calibration_sweep is not None:
+            calibration_sweep.update(logits_cpu, target_cpu)
         if "adjusted_logits" in outputs:
-            metrics.update(_prefix_metrics(brats_region_metrics(outputs["adjusted_logits"].detach().cpu(), target.detach().cpu(), threshold=args.threshold), "adjusted"))
+            adjusted_cpu = outputs["adjusted_logits"].detach().cpu()
+            adjusted_metrics = brats_region_metrics(adjusted_cpu, target_cpu, threshold=args.threshold)
+            adjusted_metric_items.append(adjusted_metrics)
+            metrics.update(_prefix_metrics(adjusted_metrics, "adjusted"))
+            if adjusted_calibration_sweep is not None:
+                adjusted_calibration_sweep.update(adjusted_cpu, target_cpu)
         if "context_swap_logits" in outputs:
-            metrics.update(_prefix_metrics(brats_region_metrics(outputs["context_swap_logits"].detach().cpu(), target.detach().cpu(), threshold=args.threshold), "context_swap"))
+            metrics.update(_prefix_metrics(brats_region_metrics(outputs["context_swap_logits"].detach().cpu(), target_cpu, threshold=args.threshold), "context_swap"))
+        registered_image = batch.get("registered_image")
+        if isinstance(registered_image, Tensor) and _uses_registered_modality_validation(args):
+            registered_outputs = model(
+                registered_image.to(device),
+                context_bank=None,
+                adversary_strength=args.adversary_strength,
+                max_contrastive_negatives=args.cite_bank_negatives,
+            )
+            registered_logits = registered_outputs.get("logits")
+            if isinstance(registered_logits, Tensor):
+                registered_tta_logits = _fuse_registered_modality_logits(
+                    outputs["logits"],
+                    registered_logits,
+                    str(getattr(args, "checkpoint_registered_modality_fusion", "mean-probs")),
+                )
+                metrics.update(
+                    registered_modality_consistency_metrics(
+                        outputs["logits"],
+                        registered_logits,
+                        fused_logits=registered_tta_logits,
+                        threshold=float(args.threshold),
+                    )
+                )
+                registered_tta_cpu = registered_tta_logits.detach().cpu()
+                metrics.update(
+                    _prefix_metrics(
+                        brats_region_metrics(registered_tta_cpu, target_cpu, threshold=args.threshold),
+                        "registered_tta",
+                    )
+                )
+                if registered_tta_calibration_sweep is not None:
+                    registered_tta_calibration_sweep.update(registered_tta_cpu, target_cpu)
+        metrics.update(_et_volume_veto_metric_item(outputs))
         metric_items.append(metrics)
         if args.max_val_batches is not None and batch_idx >= args.max_val_batches:
             break
-    return {**_average_metric_dicts(loss_logs), **_average_metric_dicts(metric_items)}
+    summary = {**_average_metric_dicts(loss_logs), **_average_metric_dicts(metric_items)}
+    if calibration_sweep is not None:
+        summary.update(prefix_metrics(calibration_sweep.summary(), "sweep_region_calibrated"))
+    if adjusted_metric_items and adjusted_calibration_sweep is not None:
+        summary.update(prefix_metrics(adjusted_calibration_sweep.summary(), "adjusted_sweep_region_calibrated"))
+    if registered_tta_calibration_sweep is not None:
+        summary.update(prefix_metrics(registered_tta_calibration_sweep.summary(), "registered_tta_sweep_region_calibrated"))
+    if "loss/total" in summary:
+        summary["selection/negative_loss"] = -float(summary["loss/total"])
+    return summary
 
 
 def _add_causal_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--context-bank-size", type=int, default=64)
+    parser.add_argument("--init-checkpoint", help="Optional causal MedNeXt checkpoint to initialize compatible weights before training.")
     parser.add_argument("--context-bank-sampling", choices=["uniform", "random", "farthest"], default="uniform")
     parser.add_argument("--adjustment-contexts", type=int, default=4)
+    parser.add_argument(
+        "--adjustment-context-selection",
+        choices=["uniform", "nearest", "farthest", "diverse-nearest"],
+        default="uniform",
+        help="How the SCM adjustment selects contexts from the proxy bank for each target case.",
+    )
     parser.add_argument("--context-swap-strategy", choices=["none", "random", "nearest", "farthest"], default="none")
     parser.add_argument("--context-bank-refresh-epochs", type=int, default=1)
     parser.add_argument("--freeze-backbone-epochs", type=int, default=1)
+    parser.add_argument("--checkpoint-calibration-thresholds", help="Optional WT/TC/ET threshold grid for calibrated validation checkpoint selection.")
+    parser.add_argument(
+        "--checkpoint-calibration-objective",
+        choices=CALIBRATION_OBJECTIVES,
+        default="mean",
+        help="Objective used when choosing validation thresholds from --checkpoint-calibration-thresholds.",
+    )
+    parser.add_argument("--checkpoint-registered-modality-tta", action="store_true", help="Use native/ANTS registered-modality TTA metrics for validation checkpoint selection.")
+    parser.add_argument(
+        "--checkpoint-registered-modality-selector",
+        choices=["dice", "agreement", "region-prob-similarity", "stability", "prob-response", "region-prob-response", "val-loss"],
+        default="dice",
+        help="Checkpoint selector to use when --checkpoint-registered-modality-tta is enabled.",
+    )
+    parser.add_argument(
+        "--checkpoint-registered-modality-fusion",
+        choices=["mean-logits", "mean-probs", "max-probs", "registered-only"],
+        default="mean-probs",
+    )
     parser.add_argument("--grad-clip", type=float, default=1.0)
     parser.add_argument("--context-stability-margin", type=float, default=0.03)
     parser.add_argument("--context-response-target", type=float, default=0.0)
@@ -895,8 +1593,15 @@ def _add_causal_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--cite-temperature", type=float, default=0.2)
     parser.add_argument("--cite-bank-negatives", type=int, default=16)
     parser.add_argument("--region-volume-scale", type=float, default=1000.0)
+    parser.add_argument("--seg-loss-mode", choices=["bce_dice", "balanced_focal"], default="bce_dice")
     parser.add_argument("--channel-loss-weights", default="1.0,1.0,1.0")
     parser.add_argument("--region-loss-weights", default="1.0,1.5,2.5")
+    parser.add_argument("--balanced-bce-max-pos-weight", type=float, default=50.0)
+    parser.add_argument("--focal-tversky-alpha", type=float, default=0.7)
+    parser.add_argument("--focal-tversky-beta", type=float, default=0.3)
+    parser.add_argument("--focal-tversky-gamma", type=float, default=0.75)
+    parser.add_argument("--lambda-volume-prior-loss", type=float, default=0.0)
+    parser.add_argument("--volume-prior-scale", type=float, default=1000.0)
     parser.add_argument("--distill-channel-weights", default="1.0,1.0,2.0")
     parser.add_argument("--proxy-loss-mode", choices=["mse", "typed"], default="typed")
     parser.add_argument("--teacher-temperature", type=float, default=1.0)
@@ -917,6 +1622,12 @@ def _add_causal_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--lambda-context-from-disease-adversary", type=float, default=0.02)
     parser.add_argument("--lambda-disease-from-context-adversary", type=float, default=0.02)
     parser.add_argument("--lambda-region-volume-proxy", type=float, default=0.05)
+    parser.add_argument("--et-volume-veto-scale", type=float, default=0.0)
+    parser.add_argument("--et-volume-veto-warmup-epochs", type=int, default=0)
+    parser.add_argument("--et-volume-veto-ramp-epochs", type=int, default=0)
+    parser.add_argument("--et-volume-veto-multiplier", type=float, default=4.0)
+    parser.add_argument("--et-volume-veto-min-fraction", type=float, default=5e-4)
+    parser.add_argument("--et-volume-veto-max-bias", type=float, default=4.0)
     parser.add_argument("--lambda-region-from-context-adversary", type=float, default=0.02)
     parser.add_argument("--lambda-sdd-context-teacher", type=float, default=0.03)
     parser.add_argument("--lambda-sdd-region-teacher", type=float, default=0.05)
@@ -965,6 +1676,38 @@ def _add_causal_args(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--lambda-style-intervention-consistency", type=float, default=0.0)
     parser.add_argument("--lambda-style-disease-invariance", type=float, default=0.0)
     parser.add_argument("--lambda-style-context-response", type=float, default=0.0)
+    parser.add_argument("--lambda-registered-modality-seg", type=float, default=0.0)
+    parser.add_argument("--registered-modality-channel-loss-weights", default="")
+    parser.add_argument("--registered-modality-region-loss-weights", default="")
+    parser.add_argument("--registered-modality-start-channel-loss-weights", default="")
+    parser.add_argument("--registered-modality-start-region-loss-weights", default="")
+    parser.add_argument("--registered-modality-weight-ramp-epochs", type=int, default=0)
+    parser.add_argument("--registered-modality-small-lesion-emphasis", type=float, default=0.0)
+    parser.add_argument("--registered-modality-small-lesion-reference-fractions", default="0.015,0.006,0.003")
+    parser.add_argument("--registered-modality-small-lesion-region-weights", default="0.5,1.0,1.5")
+    parser.add_argument("--registered-modality-small-lesion-max-weight", type=float, default=2.0)
+    parser.add_argument("--registered-modality-error-emphasis", type=float, default=0.0)
+    parser.add_argument("--registered-modality-error-region-weights", default="0.3,1.0,1.5")
+    parser.add_argument("--registered-modality-error-max-weight", type=float, default=1.5)
+    parser.add_argument("--hard-case-sampler-emphasis", type=float, default=0.0)
+    parser.add_argument("--hard-case-sampler-reference-fractions", default="0.015,0.006,0.003")
+    parser.add_argument("--hard-case-sampler-region-weights", default="0.5,1.0,1.5")
+    parser.add_argument("--hard-case-sampler-max-weight", type=float, default=3.0)
+    parser.add_argument("--hard-case-sampler-epoch-multiplier", type=float, default=1.0)
+    parser.add_argument("--lambda-registered-modality-consistency", type=float, default=0.0)
+    parser.add_argument("--lambda-registered-modality-region-consistency", type=float, default=0.0)
+    parser.add_argument("--registered-modality-region-consistency-weights", default="1.0,1.5,2.5")
+    parser.add_argument("--lambda-registered-modality-wt-consistency", type=float, default=0.0)
+    parser.add_argument("--lambda-registered-modality-fusion-seg", type=float, default=0.0)
+    parser.add_argument(
+        "--registered-modality-fusion-mode",
+        choices=["mean-probs", "mean-logits", "max-probs", "registered-only"],
+        default="mean-probs",
+    )
+    parser.add_argument("--lambda-registered-modality-view-advantage-distillation", type=float, default=0.0)
+    parser.add_argument("--registered-modality-view-advantage-region-weights", default="0.25,1.0,1.5")
+    parser.add_argument("--registered-modality-view-advantage-margin", type=float, default=0.0)
+    parser.add_argument("--lambda-registered-modality-disease-invariance", type=float, default=0.0)
     parser.add_argument("--feature-intervention-prob", type=float, default=0.0)
     parser.add_argument("--feature-mask-prob", type=float, default=0.15)
     parser.add_argument("--feature-mask-block-size", type=int, default=4)
@@ -988,6 +1731,7 @@ def _add_causal_args(parser: argparse.ArgumentParser) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Train causal MedNeXt on UTSW with disease/context proxy adjustment.")
+    parser.add_argument("--config-json", help="Load saved trainer arguments before applying explicit CLI overrides.")
     parser.add_argument("--baseline-checkpoint", default="runs/mednext_utsw_s_k3/best.pt")
     parser.add_argument("--data-root", default="data/brats/PKG - UTSW-Glioma/UTSW-Glioma")
     parser.add_argument("--metadata-path")
@@ -1018,9 +1762,21 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--prefer-manual-seg", action="store_true")
     parser.add_argument("--use-ants-modalities", action="store_true")
     parser.add_argument("--pin-memory", action="store_true")
+    parser.add_argument("--disk-cache-dir", help="Optional MedNeXt-only disk cache for preprocessed dataset items.")
     parser.add_argument("--allow-missing-metadata", action="store_true")
     parser.add_argument("--threshold", type=float, default=0.5)
     _add_causal_args(parser)
+    config_args, _ = parser.parse_known_args()
+    if config_args.config_json:
+        saved_config = _load_json(Path(config_args.config_json))
+        destinations = {action.dest for action in parser._actions}
+        parser.set_defaults(
+            **{
+                key: value
+                for key, value in saved_config.items()
+                if key in destinations and key != "config_json"
+            }
+        )
     return parser.parse_args()
 
 
@@ -1039,15 +1795,32 @@ def main() -> None:
     _save_json(vars(args), output_dir / "config.json")
     _save_json(asdict(default_utsw_scm()), output_dir / "scm.json")
 
-    train_loader = _make_loader(data_root, splits["train"], args, shuffle=True)
-    val_loader = _make_loader(data_root, splits["val"], args, shuffle=False)
-    bank_loader = _make_loader(data_root, splits["train"], args, shuffle=False)
+    train_loader = _make_loader(
+        data_root,
+        splits["train"],
+        args,
+        shuffle=True,
+        cache_name="train",
+        registered_modality_pair=_uses_registered_modality_training(args),
+    )
+    val_loader = _make_loader(
+        data_root,
+        splits["val"],
+        args,
+        shuffle=False,
+        cache_name="val",
+        registered_modality_pair=_uses_registered_modality_validation(args),
+    )
+    bank_loader = _make_loader(data_root, splits["train"], args, shuffle=False, cache_name="train")
     _require_metadata(train_loader.dataset, args.allow_missing_metadata)
     proxy_layout = _metadata_layout(train_loader.dataset)
 
     device = _resolve_device(args.device)
     model = _build_model_from_dataset(args, train_loader.dataset)
     _load_baseline_backbone(model, Path(args.baseline_checkpoint))
+    init_report = _load_causal_init_checkpoint(model, args.init_checkpoint)
+    if init_report:
+        _save_json(init_report, output_dir / "init_checkpoint.json")
     model.to(device)
     optimizer = _build_optimizer(model, args)
     teacher_checkpoint = args.teacher_checkpoint
@@ -1060,7 +1833,8 @@ def main() -> None:
         teacher_checkpoint = args.baseline_checkpoint
     teacher_model = _build_teacher_model(teacher_checkpoint, device)
 
-    best_adjusted_dice = float("-inf")
+    best_monitor = float("-inf")
+    best_monitor_key = "adjusted/brats/mean_dice"
     contrastive_bank: dict[str, Tensor] | None = None
     lesion_bank = (
         LesionInterventionBank(
@@ -1087,6 +1861,9 @@ def main() -> None:
         max_batches=args.lesion_prefill_batches,
     )
     for epoch in range(1, args.epochs + 1):
+        setattr(args, "_current_epoch", epoch)
+        effective_et_veto_scale = _set_et_volume_veto_scale_for_epoch(model, args, epoch)
+        registered_weight_alpha = _registered_modality_weight_schedule_alpha(args, epoch)
         _set_backbone_trainable(model, epoch > args.freeze_backbone_epochs)
         category_report = build_category_confounder_dictionary(
             model,
@@ -1121,7 +1898,11 @@ def main() -> None:
             teacher_model,
         )
         val_metrics = _run_eval_epoch(model, val_loader, device, args, context_bank, contrastive_bank, proxy_layout)
-        monitor = float(val_metrics.get("adjusted/brats/mean_dice", val_metrics.get("brats/mean_dice", float("-inf"))))
+        train_metrics["schedule/et_volume_veto_scale"] = float(effective_et_veto_scale)
+        val_metrics["schedule/et_volume_veto_scale"] = float(effective_et_veto_scale)
+        train_metrics["schedule/registered_modality_weight_alpha"] = float(registered_weight_alpha)
+        val_metrics["schedule/registered_modality_weight_alpha"] = float(registered_weight_alpha)
+        monitor, monitor_key = checkpoint_monitor(val_metrics, args, prefer_adjusted=True)
         _save_json(
             {
                 "epoch": epoch,
@@ -1139,6 +1920,11 @@ def main() -> None:
                 "val_loss": val_metrics.get("loss/total"),
                 "val_factual_mean_dice": val_metrics.get("brats/mean_dice"),
                 "val_adjusted_mean_dice": val_metrics.get("adjusted/brats/mean_dice"),
+                "val_registered_tta_mean_dice": val_metrics.get("registered_tta/brats/mean_dice"),
+                "val_registered_consistency_stability": val_metrics.get("registered_consistency/stability_score"),
+                "monitor": monitor,
+                "monitor_key": monitor_key,
+                "et_volume_veto_scale": effective_et_veto_scale,
             }
         )
 
@@ -1154,11 +1940,12 @@ def main() -> None:
             "val_metrics": val_metrics,
         }
         torch.save(checkpoint, output_dir / "last.pt")
-        if monitor > best_adjusted_dice:
-            best_adjusted_dice = monitor
+        if monitor > best_monitor:
+            best_monitor = monitor
+            best_monitor_key = monitor_key
             torch.save(checkpoint, output_dir / "best.pt")
 
-    print({"best_val_adjusted_brats_mean_dice": best_adjusted_dice, "output_dir": str(output_dir)})
+    print({"best_val_monitor": best_monitor, "best_val_monitor_key": best_monitor_key, "output_dir": str(output_dir)})
 
 
 if __name__ == "__main__":
