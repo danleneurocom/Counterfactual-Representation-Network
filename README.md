@@ -163,16 +163,3 @@ PYTHONPATH=.:src python -m py_compile \
 PYTHONPATH=.:src python -m pytest tests/test_metrics.py tests/test_mednext_baseline.py
 ```
 
-## Artifact Policy
-
-Do not commit:
-
-- `data/`
-- `runs/`
-- `experiments/`
-- virtual environments
-- model checkpoints (`*.pt`, `*.ckpt`)
-- private research notes
-
-For public release cleanup, see
-[docs/PUBLIC_RELEASE_CHECKLIST.md](docs/PUBLIC_RELEASE_CHECKLIST.md).
