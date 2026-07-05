@@ -1,4 +1,4 @@
-# Causal MedNeXt for OOD Brain Tumor Segmentation
+# TRACE-Seg3D: Causal MedNeXt for OOD Brain Tumor Segmentation
 
 This repository contains the code used for our current causal MedNeXt
 out-of-distribution brain tumor segmentation experiments. The main model is a
@@ -6,20 +6,6 @@ out-of-distribution brain tumor segmentation experiments. The main model is a
 context-aware segmentation, TC/ET-aware calibration, and anatomical
 region-plausibility constraints.
 
-The current strongest verified OOD smoke result is UTSW -> BraTS:
-
-```text
-Mean Dice 0.792 | WT 0.852 | TC 0.820 | ET 0.703
-```
-
-The corresponding evaluation artifact is:
-
-```text
-runs/_ood_causal_adapt_brats_v5_et_precision_e2/brats_val_structural_min32_metrics.json
-```
-
-Large checkpoints, run folders, and medical imaging data are intentionally not
-tracked in git. Share checkpoints separately as artifacts.
 
 ## Repository Map
 
