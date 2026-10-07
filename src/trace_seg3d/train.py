@@ -96,6 +96,13 @@ def validate(model: TraceMedNeXt, loader: DataLoader, device: torch.device, amp:
     return {"val/WT": float(d[0]), "val/TC": float(d[1]), "val/ET": float(d[2]), "val/mean": float(d.mean())}
 
 
+def _atomic_save(obj: Any, path: Path) -> None:
+    """Write to a temp file and rename, so a session killed mid-write never leaves a corrupt checkpoint."""
+    tmp = path.with_suffix(path.suffix + ".tmp")
+    torch.save(obj, tmp)
+    tmp.replace(path)
+
+
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--data-dir", required=True, type=Path)
@@ -134,6 +141,7 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--max-train-cases", type=int, help="smoke tests only")
     p.add_argument("--max-val-cases", type=int, help="smoke tests only")
     p.add_argument("--cache-in-memory", action="store_true")
+    p.add_argument("--no-resume", action="store_true", help="ignore OUT/resume.pt and start from scratch")
     return p.parse_args(argv)
 
 
@@ -197,8 +205,27 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         "val_ids": val_ids,
     }
     (args.out / "config.json").write_text(json.dumps(config, indent=2))
-    best, history = -1.0, []
-    for epoch in range(1, args.epochs + 1):
+    best, history, start_epoch = -1.0, [], 1
+    resume_path = args.out / "resume.pt"
+    if resume_path.exists() and not args.no_resume:
+        ck = torch.load(resume_path, map_location=device, weights_only=False)
+        # paths and loader settings may change between sessions (Colab -> Kaggle, new state dir) without affecting training
+        volatile = {"workers", "no_resume", "device", "data_dir", "splits", "out", "cache_in_memory"}
+        same = {k: v for k, v in ck["config"]["args"].items() if k not in volatile} == {k: v for k, v in config["args"].items() if k not in volatile}
+        if same:
+            model.load_state_dict(ck["model"])
+            optimizer.load_state_dict(ck["optimizer"])
+            scheduler.load_state_dict(ck["scheduler"])
+            scaler.load_state_dict(ck["scaler"])
+            queue.mus, queue.sigmas = ck["queue"]
+            best, history, start_epoch = ck["best"], ck["history"], ck["epoch"] + 1
+            torch.set_rng_state(ck["rng_cpu"])
+            if device.type == "cuda" and ck.get("rng_cuda") is not None:
+                torch.cuda.set_rng_state(ck["rng_cuda"])
+            print(json.dumps({"resumed_from_epoch": ck["epoch"], "best_val_mean_dice": best}))
+        else:
+            print("!! resume.pt ignored: training arguments differ from the interrupted run")
+    for epoch in range(start_epoch, args.epochs + 1):
         model.train()
         t0 = time.time()
         sums: dict[str, float] = {}
@@ -249,17 +276,26 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
             sums["total"] = sums.get("total", 0.0) + float(loss.detach())
             n += 1
         log: dict[str, Any] = {"epoch": epoch, "lr": scheduler.get_last_lr()[0], "time_s": round(time.time() - t0, 1)}
+        if device.type == "cuda":
+            log["gpu_peak_gb"] = round(torch.cuda.max_memory_allocated(device) / 1024**3, 2)
         log.update({f"train/{k}": v / max(n, 1) for k, v in sums.items()})
         if epoch % args.val_every == 0 or epoch == args.epochs:
             log.update(validate(model, val_loader, device, args.amp))
             state = {"model": model.state_dict(), "config": config, "epoch": epoch, "val": log}
-            torch.save(state, args.out / "last.pt")
+            _atomic_save(state, args.out / "last.pt")
             if log["val/mean"] > best:
                 best = log["val/mean"]
-                torch.save(state, args.out / "best.pt")
+                _atomic_save(state, args.out / "best.pt")
         history.append(log)
         print(json.dumps(log))
         (args.out / "history.json").write_text(json.dumps(history, indent=1))
+        # full training state every epoch -> a disconnected Colab session continues where it stopped
+        _atomic_save({
+            "model": model.state_dict(), "optimizer": optimizer.state_dict(), "scheduler": scheduler.state_dict(),
+            "scaler": scaler.state_dict(), "queue": (queue.mus, queue.sigmas), "best": best, "history": history,
+            "epoch": epoch, "config": config, "rng_cpu": torch.get_rng_state(),
+            "rng_cuda": torch.cuda.get_rng_state() if device.type == "cuda" else None,
+        }, resume_path)
 
     # source-train context bank with the selected weights, stored in the checkpoint
     for name in ("best.pt", "last.pt"):
@@ -268,9 +304,10 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
         model.load_state_dict(state["model"])
         bank = build_bank(model, bank_loader, device, dataset_name, args.amp)
         state["bank"] = bank.state()
-        torch.save(state, path)
+        _atomic_save(state, path)
     summary = {"best_val_mean_dice": best, "out": str(args.out), "source_dataset": dataset_name, "mode": args.mode}
     (args.out / "summary.json").write_text(json.dumps(summary, indent=2))
+    resume_path.unlink(missing_ok=True)
     print(json.dumps(summary))
     return summary
 

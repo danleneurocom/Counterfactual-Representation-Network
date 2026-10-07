@@ -1,0 +1,14 @@
+diff a/baselines/segformer3d/evaluate_causal_brats_h5.py b/baselines/segformer3d/evaluate_causal_brats_h5.py	(rejected hunks)
+@@ -245,10 +245,10 @@ class BraTSH5VolumeDataset(Dataset):
+         observed_context = _brats_context_proxy(image)
+         observed_disease = _brats_disease_proxy(mask)
+         observed_annotation = _brats_annotation_proxy(image)
+-        for modality in range(image.shape[0]):
+-            image[modality] = _normalize_mri(image[modality])
+         original_shape = image.shape[1:]
++        # FIX: crop on raw intensities first, then normalise (see data/utsw.py)
+         image, mask = _crop_to_foreground(image, mask, self.crop_margin)
++        image = np.stack([_normalize_mri(image[modality]) for modality in range(image.shape[0])], axis=0)
+         image_tensor, mask_tensor = _resize_volume(image, mask, self.volume_size)
+         return {
+             "case_id": f"volume_{volume_id}",

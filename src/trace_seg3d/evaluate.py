@@ -88,7 +88,8 @@ def load_calibration(path: Path | None, config: dict[str, Any], ckpt: Path) -> d
     calib = json.loads(Path(path).read_text())
     if calib.get("split") != "val" or calib.get("source_dataset") != config["source_dataset"]:
         raise AssertionError(f"calibration must come from the SOURCE val split ({config['source_dataset']}), got {calib.get('source_dataset')}/{calib.get('split')}")
-    if Path(calib["ckpt"]).resolve().parent != Path(ckpt).resolve().parent:
+    # compare <source>/<run> only: the runs folder may move between machines (Colab Drive -> Kaggle)
+    if Path(calib["ckpt"]).parent.parts[-2:] != Path(ckpt).resolve().parent.parts[-2:]:
         raise AssertionError("calibration file belongs to a different training run")
     calib["calibrated"] = True
     return calib
