@@ -52,7 +52,16 @@ Ma trận đầy đủ gồm 2 nguồn × (3 phương pháp × 3 seed + 3 ablati
 
 ### Chạy trên Kaggle (2× T4, khuyên dùng)
 
-`scripts/isbi/TRACE_ISBI_kaggle.ipynb` (hướng dẫn cài đặt ở cell đầu). Mỗi lần chỉ cần *Save Version*: notebook lấy code từ GitHub, tải trạng thái từ 2 Kaggle Dataset private (`trace-isbi-data`, `trace-isbi-runs`, qua `kaggle_sync.py`), chạy `kaggle_runner.py` (2 job song song, thứ tự A → B → C, eval sơ bộ sau seed 0 và eval lại khi đủ seed, dừng trước 12 giờ, train dở thì tiếp từ `resume.pt`), rồi lưu trạng thái và đẩy bảng/log lên branch `isbi-results`.
+`scripts/isbi/TRACE_ISBI_kaggle.ipynb` (hướng dẫn cài đặt ở cell đầu). Mỗi lần chỉ cần *Save Version*: notebook lấy code mới nhất từ Kaggle Dataset `trace-code`, tải trạng thái từ 2 Kaggle Dataset private (`trace-isbi-data`, `trace-isbi-runs`, qua `kaggle_sync.py`), chạy `kaggle_runner.py` (2 job song song, thứ tự A → B → C, eval sơ bộ sau seed 0 và eval lại khi đủ seed, dừng trước 12 giờ, train dở thì tiếp từ `resume.pt`), rồi lưu trạng thái và tạo `results.zip`. (`kaggle_sync.py push-git` có thể đẩy bảng/log lên một branch GitHub nếu cần.)
+
+### Thí nghiệm cho hướng "audit" (chỉ eval, không train thêm)
+
+* `trace_seg3d.shifts` + `evaluate --shift bias:2` : dịch chuyển giả lập có kiểm soát (bias field, gamma, noise, lát dày), tái lập được theo case.
+* `evaluate --cct-k / --cct-selection / --cct-levels` : ablation CCT lúc inference (K, chọn bank, tầng transport).
+* `trace_seg3d.probe` : kiểm tra giả định causal (moments ~ ngữ cảnh, content ~ bệnh) bằng probe tuyến tính.
+* `trace_seg3d.audit` : thêm bootstrap CI và kiểm định cặp so với entropy / TTA.
+* `trace_seg3d.extra_report` : gom thành `results/extra/{shift_curves,shift_audit,cct_ablation,probes}.md`.
+* `scripts/isbi/kaggle_plan.json` : kế hoạch chạy đi kèm code, ghi đè cell PLAN của notebook (chỉ cần upload zip mới).
 
 ## 3. Kết quả → paper
 

@@ -10,7 +10,7 @@ GitHub branch so they can be read without opening Kaggle.
     python scripts/isbi/kaggle_sync.py push --state /kaggle/working/trace_state --note "version 3"
     python scripts/isbi/kaggle_sync.py push-git --state ... --repo owner/name --branch isbi-results
 
-Credentials come from the environment: KAGGLE_USERNAME / KAGGLE_KEY (Kaggle API token) and GITHUB_TOKEN.
+Credentials come from the environment: KAGGLE_USERNAME + KAGGLE_API_TOKEN (new KGAT_ token, kaggle>=1.8) or KAGGLE_KEY (legacy), and GITHUB_TOKEN.
 For tests, TRACE_SYNC_LOCAL=<dir> replaces the Kaggle API by a local folder.
 """
 
@@ -115,7 +115,7 @@ def pull(args) -> None:
             if not be.download(slug, Path(tmp)):
                 log(f"{slug}: not found (first version?) -> nothing to pull")
                 continue
-            for tf in sorted(Path(tmp).rglob("*.tar")):
+            for tf in sorted([*Path(tmp).rglob("*.tar"), *Path(tmp).rglob("*.bin")]):
                 with tarfile.open(tf) as tar:
                     try:
                         tar.extractall(args.state, filter="data")
@@ -129,6 +129,8 @@ def pull(args) -> None:
                         shutil.copytree(hit, args.state / part, dirs_exist_ok=True)
                     elif hit.is_file():
                         shutil.copy2(hit, args.state / part)
+            if not [*Path(tmp).rglob("*.tar"), *Path(tmp).rglob("*.bin")]:
+                log(f"{slug}: downloaded but no archive inside ({[q.name for q in Path(tmp).rglob('*')][:10]}) -> nothing restored")
             m = Path(tmp) / "manifest.json"
             if m.exists():
                 shutil.copy2(m, args.state / f".{slug}.manifest.json")
@@ -143,16 +145,19 @@ def push(args) -> None:
     old = json.loads(old_path.read_text()) if old_path.exists() else None
     if current["datasets"] and current != old:
         with tempfile.TemporaryDirectory() as tmp:
-            parts = _tar(state, DATA_PARTS, Path(tmp) / "data.tar")
+            parts = _tar(state, DATA_PARTS, Path(tmp) / "data.bin")  # .bin: Kaggle must not unpack it
             (Path(tmp) / "manifest.json").write_text(json.dumps(current))
-            log(f"uploading {args.data_slug} ({parts}, {(Path(tmp) / 'data.tar').stat().st_size / 1e9:.2f} GB) ...")
+            log(f"uploading {args.data_slug} ({parts}, {(Path(tmp) / 'data.bin').stat().st_size / 1e9:.2f} GB) ...")
             be.upload(args.data_slug, Path(tmp), args.note)
             old_path.write_text(json.dumps(current))
     else:
         log(f"{args.data_slug}: unchanged ({current['datasets']}) -> not re-uploaded")
+    if not (state / "runs").exists():
+        log(f"{args.runs_slug}: no runs yet -> nothing to upload")
+        return
     with tempfile.TemporaryDirectory() as tmp:
-        parts = _tar(state, RUNS_PARTS, Path(tmp) / "runs.tar")
-        size = (Path(tmp) / "runs.tar").stat().st_size / 1e9
+        parts = _tar(state, RUNS_PARTS, Path(tmp) / "runs.bin")
+        size = (Path(tmp) / "runs.bin").stat().st_size / 1e9
         log(f"uploading {args.runs_slug} ({parts}, {size:.2f} GB) ...")
         be.upload(args.runs_slug, Path(tmp), args.note)
     log("push done")

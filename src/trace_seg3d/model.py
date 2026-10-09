@@ -101,11 +101,16 @@ class TraceMedNeXt(nn.Module):
         stats = [feature_moments(features[l]) for l in self.transport_levels]
         return features, stats
 
-    def transport(self, features: tuple[Tensor, ...], stats: Stats, target: Stats, alpha: float | Tensor = 1.0) -> tuple[Tensor, ...]:
-        """AdaIN: keep normalised content, swap moments with ``target`` (alpha=1 -> full swap)."""
+    def transport(self, features: tuple[Tensor, ...], stats: Stats, target: Stats, alpha: float | Tensor = 1.0,
+                  only: Sequence[int] | None = None) -> tuple[Tensor, ...]:
+        """AdaIN: keep normalised content, swap moments with ``target`` (alpha=1 -> full swap).
+
+        ``only``: transport just these feature levels (inference-time ablation); default = all."""
 
         out = list(features)
         for (mu, sigma), (mu_t, sigma_t), level in zip(stats, target, self.transport_levels):
+            if only is not None and level not in only:
+                continue
             f = features[level]
             dtype = f.dtype
             a = alpha if not isinstance(alpha, Tensor) else alpha.view(-1, 1)
@@ -156,7 +161,7 @@ class TraceMedNeXt(nn.Module):
         return out
 
     @torch.no_grad()
-    def cct(self, x: Tensor, bank: "ContextBank", k: int, selection: str = "diverse") -> dict[str, Tensor]:
+    def cct(self, x: Tensor, bank: "ContextBank", k: int, selection: str = "diverse", levels: Sequence[int] | None = None) -> dict[str, Tensor]:
         """Counterfactual Context Transport at inference: factual probs, consensus, instability."""
 
         shape = tuple(x.shape[-3:])
@@ -165,7 +170,7 @@ class TraceMedNeXt(nn.Module):
         probs = []
         for target in bank.select(k, selection=selection, anchor=stats):
             target_b = [(mu.expand(x.shape[0], -1), sigma.expand(x.shape[0], -1)) for mu, sigma in target]
-            probs.append(torch.sigmoid(self.decode(self.transport(features, stats, target_b), shape).float()))
+            probs.append(torch.sigmoid(self.decode(self.transport(features, stats, target_b, only=levels), shape).float()))
         stack = torch.stack(probs, dim=0)
         return {
             "factual": factual,

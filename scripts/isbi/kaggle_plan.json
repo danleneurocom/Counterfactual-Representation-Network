@@ -1,0 +1,12 @@
+{
+  "_comment": "Overrides the PLAN cell of the Kaggle notebook (shipped with the code, so a new zip is enough). Audit-paper plan: no training-time ablations; evaluation-only shifts, CCT ablations and probes instead.",
+  "methods": "baseline styleaug trace",
+  "seeds": "0 1 2",
+  "ablations": "",
+  "shifts": "bias:1 bias:2 gamma:1 gamma:2 noise:1 noise:2 lowres:1 lowres:2",
+  "shift_sources": "brats",
+  "infer_ablations": "k1 k2 k8 random skips bottleneck",
+  "infer_abl_methods": "baseline trace",
+  "probes": 1,
+  "shift_seeds": "0 1 2"
+}

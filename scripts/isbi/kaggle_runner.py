@@ -31,6 +31,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+RUNNER_VERSION = "2026-10-09b"
 DATASETS = ("brats", "utsw")
 ABLATION_FLAGS = {"trace_nocct", "trace_nostab", "trace_noproxy"}
 
@@ -41,14 +42,14 @@ def log(msg: str) -> None:
 
 # ----------------------------------------------------------------------------------------- state
 def find_state_inputs(root: Path) -> list[Path]:
-    """Dirs (depth <= 4) that look like a saved state: contain processed/, splits/ or runs/."""
+    """Dirs (depth <= 7) that look like a saved state: contain processed/, splits/ or runs/."""
 
     found = []
     if not root.exists():
         return found
     for dirpath, dirnames, _ in os.walk(root, followlinks=True):
         depth = len(Path(dirpath).relative_to(root).parts)
-        if depth > 4:
+        if depth > 7:
             dirnames[:] = []
             continue
         if {"processed", "splits", "runs"} & set(dirnames):
@@ -92,18 +93,46 @@ def restore_state(input_root: Path, state: Path) -> int:
 
 
 # ------------------------------------------------------------------------------------- datasets
-def _subdirs(root: Path, depth: int = 5):
+def _subdirs(root: Path, depth: int = 8):
+    """Walk <= depth levels. Kaggle mounts inputs as /kaggle/input/datasets/<owner>/<slug>/..., i.e. 3 levels deep."""
+
     for dirpath, dirnames, filenames in os.walk(root, followlinks=True):
+        children = list(dirnames)  # report children even at the depth limit, then stop descending
         if len(Path(dirpath).relative_to(root).parts) >= depth:
             dirnames[:] = []
-        yield Path(dirpath), dirnames, filenames
+        yield Path(dirpath), children, filenames
 
 
 def find_brats_raw(input_root: Path) -> Path | None:
+    """Folder that directly contains >= 10 BraTS20_Training_* case folders (prefers the official name)."""
+
+    hits = []
     for d, dirnames, _ in _subdirs(input_root):
-        if d.name == "MICCAI_BraTS2020_TrainingData" and any(n.startswith("BraTS20_Training_") for n in dirnames):
-            return d
-    return None
+        if sum(1 for n in dirnames if n.startswith("BraTS20_Training_")) >= 10:
+            hits.append(d)
+    hits.sort(key=lambda d: (d.name != "MICCAI_BraTS2020_TrainingData", len(d.parts)))
+    return hits[0] if hits else None
+
+
+def download_brats() -> Path | None:
+    """Not attached as input -> fetch it with kagglehub (needs Internet; uses Kaggle's cache when available)."""
+
+    try:
+        import kagglehub
+
+        path = Path(kagglehub.dataset_download("awsaf49/brats20-dataset-training-validation"))
+        return find_brats_raw(path)
+    except Exception as e:  # noqa: BLE001
+        log(f"   kagglehub download failed: {e!r}"[:300])
+        return None
+
+
+def show_inputs(root: Path, depth: int = 4) -> None:
+    log(f"contents of {root} (depth <= {depth}):")
+    for d, dirnames, filenames in _subdirs(root, depth):
+        level = len(d.relative_to(root).parts)
+        if level <= depth:
+            print(f"   {'  ' * level}{d.name}/  ({len(dirnames)} dirs, {len(filenames)} files)", flush=True)
 
 
 def find_utsw_processed(input_root: Path, state: Path) -> Path | None:
@@ -118,7 +147,7 @@ def find_utsw_processed(input_root: Path, state: Path) -> Path | None:
 
 def find_utsw_raw(input_root: Path) -> tuple[Path | None, Path | None]:
     root = meta = None
-    for d, dirnames, filenames in _subdirs(input_root, depth=6):
+    for d, dirnames, filenames in _subdirs(input_root):
         if root is None and sum(1 for n in dirnames if n.startswith("BT") and n[2:].isdigit()) >= 10:
             root = d
         for f in filenames:
@@ -145,11 +174,15 @@ def prepare_data(args, env: dict) -> list[str]:
     # BraTS
     if not (proc / "brats_128" / "index.csv").exists():
         raw = find_brats_raw(args.input_root)
+        if raw is None:
+            show_inputs(args.input_root)
+            log("BraTS not found among the inputs -> trying kagglehub download ...")
+            raw = download_brats()
         if raw:
             log(f"preprocessing BraTS from {raw} (~20-40 min) ...")
             run(py + ["trace_seg3d.preprocess", "brats-nifti", "--root", str(raw), "--out", str(proc / "brats_128"), "--workers", cpu, "--size", str(args.size)], env, state / "logs" / "preprocess_brats.log")
         else:
-            log("!! BraTS not found: attach the Kaggle dataset 'awsaf49/brats20-dataset-training-validation'")
+            log("!! BraTS not found: attach the Kaggle dataset 'awsaf49/brats20-dataset-training-validation' (Add Input) or turn Internet on")
     # UTSW
     if not (proc / "utsw_128" / "index.csv").exists():
         pre = find_utsw_processed(args.input_root, state)
@@ -200,9 +233,15 @@ class Job:
     status: str = "todo"  # todo | running | done | failed | stopped
     rc: int | None = None
     extra_env: dict = field(default_factory=dict)
+    tag: str = ""                      # extra jobs: shift / ablation / probe tag
+    cmd: list[str] | None = None       # extra jobs run this command instead of run_all.sh
+    out: Path | None = None            # extra jobs are done when out/summary.json or out/probe.json exists
 
     def __post_init__(self) -> None:
-        self.name = f"{self.kind}:{self.src}/{self.method}_s{'+'.join(self.seeds)}"
+        self.name = f"{self.kind}:{self.src}/{self.method}_s{'+'.join(self.seeds)}" + (f"@{self.tag}" if self.tag else "")
+
+    def finished(self) -> bool:
+        return bool(self.out) and ((self.out / "summary.json").exists() or (self.out / "probe.json").exists())
 
 
 def run_dir(args, src: str, method: str, seed: str) -> Path:
@@ -265,6 +304,60 @@ def build_jobs(args, available: list[str]) -> tuple[list[Job], list[Job]]:
     return trains, evals
 
 
+INFER_ABLATIONS = {
+    "k1": ["--cct-k", "1"], "k2": ["--cct-k", "2"], "k8": ["--cct-k", "8"],
+    "random": ["--cct-k", "4", "--cct-selection", "random"],
+    "skips": ["--cct-k", "4", "--cct-levels", "0,1,2,3"], "bottleneck": ["--cct-k", "4", "--cct-levels", "4"],
+}
+
+
+def build_extra_jobs(args, available: list[str]) -> list[Job]:
+    """Evaluation-only jobs for the audit paper (no training): controlled shifts, inference-time CCT
+    ablations and causal-assumption probes. All use the first seed of each method."""
+
+    st, seed, jobs = args.state, args.seeds.split()[0], []
+    data = {d: str(st / "processed" / f"{d}_128") for d in available}
+    split = {d: str(st / "splits" / f"{d}.json") for d in available}
+    amp = [] if args.gpus == "cpu" else ["--amp"]
+    workers = ["--workers", str(args.workers_per_job)]
+
+    def evaluate(src: str, method: str, target: str, tag: str, extra: list[str], seed: str = seed) -> Job:
+        rd = run_dir(args, src, method, seed)
+        out = rd / f"xeval_{target}_{tag}"
+        cmd = [args.python, "-m", "trace_seg3d.evaluate", "--ckpt", str(rd / "best.pt"), "--calib", str(rd / "calib.json"),
+               "--data-dir", data[target], "--splits", split[target], "--split", "test", "--out", str(out), *workers, *amp, *extra]
+        job = Job("xeval", src, method, [seed], tag=f"{target}:{tag}", cmd=cmd, out=out)
+        if "shift" in tag and seed != args.seeds.split()[0]:  # shifts of later seeds also need the main evaluation
+            job.extra_env["needs"] = str(rd / f"eval_{target}_test" / "summary.json")
+        return job
+
+    for src in available:
+        if src in args.shift_sources.split():
+            for sd in args.shift_seeds.split():
+                for method in (args.shift_methods or args.methods).split():
+                    for sh in args.shifts.split():
+                        name, sev = sh.split(":")
+                        jobs.append(evaluate(src, method, src, f"shift-{name}-{sev}", ["--cct-k", str(args.cct_k), "--tta", "--shift", sh], seed=sd))
+        for method in args.infer_abl_methods.split():
+            for target in available:
+                for tag in args.infer_ablations.split():
+                    jobs.append(evaluate(src, method, target, f"abl-{tag}", INFER_ABLATIONS[tag]))
+        if args.probes:
+            for method in args.methods.split():
+                rd = run_dir(args, src, method, seed)
+                out = rd / "probe"
+                cmd = [args.python, "-m", "trace_seg3d.probe", "--ckpt", str(rd / "best.pt"), "--data-dir", data[src], "--splits", split[src],
+                       "--out", str(out), *workers, *amp]
+                other = [d for d in available if d != src]
+                if other:
+                    cmd += ["--other-data-dir", data[other[0]], "--other-splits", split[other[0]]]
+                jobs.append(Job("probe", src, method, [seed], tag="probe", cmd=cmd, out=out))
+    # most informative first: shifts (curves), then probes, then ablations
+    rank = {"probe": 1}
+    jobs.sort(key=lambda j: (rank.get(j.kind, 0) if "shift" in j.tag or j.kind == "probe" else 2))
+    return jobs
+
+
 def job_env(args, job: Job, base_env: dict) -> dict:
     env = dict(base_env)
     st = args.state
@@ -303,8 +396,14 @@ def start(args, job: Job, gpu: str, base_env: dict) -> None:
     handle = open(job.log_path, "a")
     handle.write(f"\n===== {time.ctime()} start on gpu {gpu}\n")
     handle.flush()
-    job.proc = subprocess.Popen(["bash", str(args.code / "scripts/isbi/run_all.sh")], cwd=args.code, env=job_env(args, job, base_env),
-                                stdout=handle, stderr=subprocess.STDOUT, start_new_session=True)
+    if job.cmd:
+        env = dict(base_env, PYTORCH_CUDA_ALLOC_CONF="expandable_segments:True")
+        if gpu not in ("", "cpu"):
+            env["CUDA_VISIBLE_DEVICES"] = gpu
+        job.proc = subprocess.Popen(job.cmd, cwd=args.code, env=env, stdout=handle, stderr=subprocess.STDOUT, start_new_session=True)
+    else:
+        job.proc = subprocess.Popen(["bash", str(args.code / "scripts/isbi/run_all.sh")], cwd=args.code, env=job_env(args, job, base_env),
+                                    stdout=handle, stderr=subprocess.STDOUT, start_new_session=True)
     job.started = time.time()
     job.status = "running"
     log(f"START {job.name} on gpu {gpu}")
@@ -361,7 +460,23 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--min-train-min", type=float, default=15, help="do not start a train job with less time left")
     p.add_argument("--min-eval-min", type=float, default=45, help="do not start an eval job with less time left")
     p.add_argument("--poll-s", type=float, default=30)
+    # evaluation-only jobs for the audit paper
+    p.add_argument("--shifts", default="bias:1 bias:2 gamma:1 gamma:2 noise:1 noise:2 lowres:1 lowres:2")
+    p.add_argument("--shift-sources", default="brats", help="source datasets whose test set gets the controlled shifts")
+    p.add_argument("--shift-methods", default="", help="default: all --methods")
+    p.add_argument("--shift-seeds", default="0", help="seeds whose checkpoints get the shift evaluations")
+    p.add_argument("--infer-ablations", default="k1 k2 k8 random skips bottleneck")
+    p.add_argument("--infer-abl-methods", default="baseline trace")
+    p.add_argument("--probes", type=int, default=1)
+    p.add_argument("--min-xeval-min", type=float, default=20, help="do not start an extra evaluation with less time left")
     args = p.parse_args(argv)
+    plan_file = args.code / "scripts" / "isbi" / "kaggle_plan.json"
+    if plan_file.exists():  # plan shipped with the code overrides the notebook cell (so a new zip is enough)
+        plan = json.loads(plan_file.read_text())
+        for k, v in plan.items():
+            if not k.startswith("_") and hasattr(args, k):
+                setattr(args, k, v)
+        log(f"plan from {plan_file.name}: { {k: v for k, v in plan.items() if not k.startswith('_')} }")
 
     t0 = time.time()
     deadline = t0 + args.hours * 3600
@@ -369,7 +484,7 @@ def main(argv: list[str] | None = None) -> None:
     base_env["PYTHONPATH"] = f"{args.code}:{args.code / 'src'}" + (f":{base_env['PYTHONPATH']}" if base_env.get("PYTHONPATH") else "")
 
     version = restore_state(args.input_root, args.state)
-    log(f"state: {args.state} (previous version {version})")
+    log(f"kaggle_runner {RUNNER_VERSION} | state: {args.state} (previous version {version})")
     available = prepare_data(args, base_env)
     log(f"datasets ready: {available or 'NONE'}")
     if not available:
@@ -404,6 +519,11 @@ def main(argv: list[str] | None = None) -> None:
     log(f"jobs: {sum(j.status == 'todo' for j in trains)} train + {sum(eval_status(g) != 'done' for g in evals)} eval to do "
         f"({sum(j.status == 'done' for j in trains)} train / {sum(eval_status(g) == 'done' for g in evals)} eval already done)")
     failed: set[str] = set()
+    extras = build_extra_jobs(args, available)
+    for j in extras:
+        if j.finished():
+            j.status = "done"
+    log(f"extra evaluation jobs: {sum(j.status == 'todo' for j in extras)} to do / {len(extras)}")
 
     running: dict[str, Job] = {}
     last_report = 0.0
@@ -448,6 +568,13 @@ def main(argv: list[str] | None = None) -> None:
                             r.kind == "eval" and r.src == g.src and r.method == g.method for r in running.values()):
                         nxt = cand
                         break
+            if nxt is None and left_min >= args.min_xeval_min:
+                for j in extras:
+                    needs = j.extra_env.get("needs")
+                    if (j.status == "todo" and j.name not in busy and j.name not in failed and trained(args, j.src, j.method, j.seeds[0])
+                            and (not needs or Path(needs).exists())):
+                        nxt = j
+                        break
             if nxt is None and left_min >= args.min_train_min:
                 for j in trains:
                     if j.status == "todo" and j.name not in busy:
@@ -457,7 +584,7 @@ def main(argv: list[str] | None = None) -> None:
                 start(args, nxt, gpu, base_env)
                 running[gpu] = nxt
         if not running:
-            todo = [j for j in trains if j.status == "todo"] + [g for g in evals if eval_status(g) != "done"]
+            todo = [j for j in trains if j.status == "todo"] + [g for g in evals if eval_status(g) != "done"] + [j for j in extras if j.status == "todo"]
             if todo:
                 log(f"{len(todo)} job(s) not started: not enough time left in this version")
             break
@@ -476,6 +603,10 @@ def main(argv: list[str] | None = None) -> None:
     r = run(["bash", str(args.code / "scripts/isbi/run_all.sh")], env, args.state / "logs" / "tables.log", check=False)
     if r.returncode != 0:
         log(f"tables step failed (normal if no eval finished yet):\n{r.stderr[-1500:]}")
+    r = run([args.python, "-m", "trace_seg3d.extra_report", "--root", str(args.state / "runs"), "--out", str(args.state / "results" / "extra")],
+            base_env, args.state / "logs" / "extra_report.log", check=False)
+    if r.returncode != 0:
+        log(f"extra report failed:\n{r.stderr[-1500:]}")
 
     # status report
     lines = [f"# TRACE ISBI – status after version {version + 1}", "", f"datasets: {', '.join(available)}", "",
@@ -485,6 +616,11 @@ def main(argv: list[str] | None = None) -> None:
         lines.append(f"| {j.name} | {st} | {train_progress(args, j) if st != 'done' else ''} |")
     for g in evals:
         lines.append(f"| {g.name} | {eval_status(g)} |  |")
+    for kind in ("xeval", "probe"):
+        group = [j for j in extras if j.kind == kind]
+        if group:
+            n_done = sum(j.finished() for j in group)
+            lines.append(f"| {kind} ({len(group)} jobs: shifts / CCT ablations / probes) | {'done' if n_done == len(group) else f'{n_done}/{len(group)} done'} |  |")
     remaining = sum(1 for line in lines[6:] if "| done |" not in line)
     lines += ["", f"**{remaining} job(s) left.** " + ("Everything finished." if remaining == 0 else
               "Save a new version of the notebook to continue.")]

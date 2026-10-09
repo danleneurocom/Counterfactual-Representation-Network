@@ -38,6 +38,7 @@ from torch.utils.data import DataLoader
 from trace_seg3d.data import CaseDataset, load_splits
 from trace_seg3d.metrics import REGIONS, case_metrics, region_targets_np, structural_prior, threshold_regions
 from trace_seg3d.model import ContextBank, TraceMedNeXt
+from trace_seg3d.shifts import apply_shift, parse_shift
 
 DEFAULT_THRESHOLDS = {"WT": 0.5, "TC": 0.5, "ET": 0.5}
 
@@ -111,21 +112,27 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
     if args.cct_k > 0 and bank is None:
         raise AssertionError("checkpoint has no source bank; re-run training to the end")
     thresholds, min_et = calib["thresholds"], int(calib["min_et_voxels"])
+    shift = parse_shift(args.shift)
+    levels = None if args.cct_levels == "all" else [int(v) for v in args.cct_levels.split(",")]
     args.out.mkdir(parents=True, exist_ok=True)
     rows: list[dict[str, Any]] = []
     saved = 0
     for batch in loader:
         x = batch["image"].to(device)
+        if shift is not None:
+            x = apply_shift(x[0], batch["brain"][0].to(device).bool(), batch["case_id"][0], shift).unsqueeze(0)
         sub = batch["target"][0].numpy() > 0.5
         brain = batch["brain"][0].numpy().astype(bool)
         spacing = float(batch["spacing"][0])
         ref = region_targets_np(sub)
         row: dict[str, Any] = {"case_id": batch["case_id"][0], "dataset": target_name, "setting": setting, "et_present": int(ref["ET"].any())}
 
+        maps: dict[str, np.ndarray] = {}  # voxel-wise audit maps for the localisation metric
         if args.tta:
             stack = tta_probs(model, x, args.amp)
             prob_t = stack[0]
             row["tta_std_mean_raw"] = stack.std(0)[0].cpu().numpy()
+            maps["tta"] = row["tta_std_mean_raw"].max(axis=0)
         else:
             prob_t = forward_probs(model, x, args.amp)
         prob = prob_t[0].cpu().numpy()
@@ -134,25 +141,29 @@ def evaluate(args: argparse.Namespace) -> dict[str, Any]:
         row.update(case_metrics(raw, ref, spacing, "raw_"))
         row.update(case_metrics(final, ref, spacing, "final_"))
         roi = _roi(final["WT"], brain)
-        row["entropy_mean"] = float(_entropy(prob)[:, roi].mean())
+        ent = _entropy(prob)
+        row["entropy_mean"] = float(ent[:, roi].mean())
+        maps["entropy"] = ent.max(axis=0)
         if "tta_std_mean_raw" in row:
             row["tta_std_mean"] = float(row.pop("tta_std_mean_raw")[:, roi].mean())
         if ensemble:
             probs = [prob] + [forward_probs(m, x, args.amp)[0].cpu().numpy() for m in ensemble]
             row["ens_std_mean"] = float(np.std(np.stack(probs), axis=0)[:, roi].mean())
         if args.cct_k > 0 and bank is not None:
-            cct = model.cct(x, bank, args.cct_k, selection=args.cct_selection)
+            cct = model.cct(x, bank, args.cct_k, selection=args.cct_selection, levels=levels)
             u = cct["instability"][0].cpu().numpy()
             consensus = cct["consensus"][0].cpu().numpy()
             cct_final = structural_prior(threshold_regions(consensus, thresholds), min_et)
             row.update(case_metrics(cct_final, ref, spacing, "cct_final_"))
             row["cct_u_mean"] = float(u[:, roi].mean())
+            maps["cct_u"] = u.max(axis=0)
             row["cct_u_frac"] = float((u.max(axis=0)[roi] > args.tau_u).mean())
             transported = [structural_prior(threshold_regions(p[0].cpu().numpy(), thresholds), min_et) for p in cct["transported"]]
             row["cct_disagree"] = float(1 - np.mean([np.mean([_mask_dice(t[r], final[r]) for r in REGIONS]) for t in transported]))
             if saved < args.save_maps:
                 np.savez_compressed(args.out / f"maps_{row['case_id']}.npz", image=batch["image"][0].numpy().astype(np.float16), prob=prob.astype(np.float16), consensus=consensus.astype(np.float16), instability=u.astype(np.float16), target=sub.astype(np.uint8))
                 saved += 1
+        row.update(localisation(maps, final, ref, brain))
         rows.append(row)
         print(f"{row['case_id']}: final mean Dice {row['final_mean_dice']:.3f}")
 
@@ -175,6 +186,45 @@ def bootstrap_ci(values: np.ndarray, n: int = 2000, seed: int = 0) -> tuple[floa
     return float(np.percentile(means, 2.5)), float(np.percentile(means, 97.5))
 
 
+def localisation(maps: dict[str, np.ndarray], pred: dict[str, np.ndarray], ref: dict[str, np.ndarray], brain: np.ndarray,
+                 max_voxels: int = 200_000, seed: int = 0) -> dict[str, float]:
+    """Does a voxel-wise audit map point at the WRONG voxels?  AUROC of the map for voxel errors
+    (prediction != reference in any region) inside the tumour neighbourhood (predicted or reference
+    whole tumour, dilated by 3 voxels). Uses the labels only to score, never to predict."""
+
+    from scipy.ndimage import binary_dilation
+    from trace_seg3d.audit import auroc
+
+    region = binary_dilation(pred["WT"] | ref["WT"], iterations=3) & brain
+    if not region.any():
+        return {}
+    error = np.zeros_like(region)
+    for r in REGIONS:
+        error |= pred[r].astype(bool) ^ ref[r].astype(bool)
+    idx = np.flatnonzero(region)
+    if len(idx) > max_voxels:
+        idx = np.random.default_rng(seed).choice(idx, max_voxels, replace=False)
+    err = error.ravel()[idx]
+    out = {"loc_error_frac": float(err.mean())}
+    for name, m in maps.items():
+        out[f"loc_auroc_{name}"] = auroc(m.ravel()[idx].astype(np.float64), err)
+    return out
+
+
+def et_extras(rows: list[dict[str, Any]], prefix: str) -> dict[str, float]:
+    """ET HD95 on ET-present cases only + false-positive rate on ET-empty cases (mean ET HD95 is
+    dominated by the 373 mm empty-case penalty and is misleading on its own)."""
+
+    present = [float(r[f"{prefix}ET_hd95"]) for r in rows if int(r["et_present"])]
+    empty = [float(r[f"{prefix}ET_pred_ml"]) > 0 for r in rows if not int(r["et_present"])]
+    return {
+        f"{prefix}ET_hd95_et_present": float(np.mean(present)) if present else float("nan"),
+        f"{prefix}ET_hd95_et_present_median": float(np.median(present)) if present else float("nan"),
+        f"{prefix}ET_fp_rate_empty": float(np.mean(empty)) if empty else float("nan"),
+        f"{prefix}n_et_empty": float(len(empty)),
+    }
+
+
 def summarise(rows: list[dict[str, Any]], config: dict[str, Any], args: argparse.Namespace, calib: dict[str, Any], setting: str) -> dict[str, Any]:
     out: dict[str, Any] = {
         "ckpt": str(args.ckpt),
@@ -189,6 +239,9 @@ def summarise(rows: list[dict[str, Any]], config: dict[str, Any], args: argparse
         "min_et_voxels": calib["min_et_voxels"],
         "debug_max_cases": args.max_cases,
         "cct_k": args.cct_k,
+        "cct_selection": args.cct_selection,
+        "cct_levels": args.cct_levels,
+        "shift": args.shift or "none",
     }
     for prefix in ("raw_", "final_", "cct_final_"):
         if not rows or f"{prefix}mean_dice" not in rows[0]:
@@ -206,6 +259,7 @@ def summarise(rows: list[dict[str, Any]], config: dict[str, Any], args: argparse
             vals = np.array([row[f"{prefix}{m}"] for row in rows], dtype=float)
             out[f"{prefix}{m}"] = float(np.nanmean(vals)) if np.isfinite(vals).any() else float("nan")
         out[f"{prefix}ET_fp_components"] = float(np.mean([row[f"{prefix}ET_fp_components"] for row in rows]))
+        out.update(et_extras(rows, prefix))
     return out
 
 
@@ -219,6 +273,8 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     p.add_argument("--out", required=True, type=Path)
     p.add_argument("--cct-k", type=int, default=4)
     p.add_argument("--cct-selection", choices=["diverse", "random"], default="diverse")
+    p.add_argument("--cct-levels", default="all", help="'all' or comma list of feature levels to transport (ablation), e.g. 0,1,2,3")
+    p.add_argument("--shift", help="controlled acquisition shift applied to the test images, e.g. bias:2 (see shifts.py)")
     p.add_argument("--tau-u", type=float, default=0.05)
     p.add_argument("--tta", action="store_true")
     p.add_argument("--ensemble-ckpts", nargs="*", type=Path)

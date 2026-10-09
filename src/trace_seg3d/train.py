@@ -219,9 +219,10 @@ def main(argv: list[str] | None = None) -> dict[str, Any]:
             scaler.load_state_dict(ck["scaler"])
             queue.mus, queue.sigmas = ck["queue"]
             best, history, start_epoch = ck["best"], ck["history"], ck["epoch"] + 1
-            torch.set_rng_state(ck["rng_cpu"])
+            # map_location moved the RNG ByteTensors to the GPU; set_rng_state needs them on the CPU
+            torch.set_rng_state(ck["rng_cpu"].cpu())
             if device.type == "cuda" and ck.get("rng_cuda") is not None:
-                torch.cuda.set_rng_state(ck["rng_cuda"])
+                torch.cuda.set_rng_state(ck["rng_cuda"].cpu())
             print(json.dumps({"resumed_from_epoch": ck["epoch"], "best_val_mean_dice": best}))
         else:
             print("!! resume.pt ignored: training arguments differ from the interrupted run")
