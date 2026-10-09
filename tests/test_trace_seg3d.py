@@ -154,3 +154,40 @@ def test_audit_metrics():
     perfect = 1 - dice
     assert auroc(perfect, dice < 0.5) == 1.0
     assert aurc(perfect, 1 - dice) <= aurc(np.zeros(4), 1 - dice) + 1e-9
+
+
+def test_shifts_are_deterministic_and_keep_normalisation():
+    import torch
+
+    from trace_seg3d.shifts import SEVERITY, apply_shift, parse_shift
+
+    g = torch.Generator().manual_seed(0)
+    image = torch.randn((4, 24, 24, 24), generator=g)
+    brain = torch.zeros((24, 24, 24), dtype=torch.bool)
+    brain[4:20, 4:20, 4:20] = True
+    image = image * brain
+    for name in SEVERITY:
+        shift = parse_shift(f"{name}:2")
+        a = apply_shift(image, brain, "case1", shift)
+        b = apply_shift(image, brain, "case1", shift)
+        assert torch.equal(a, b)
+        assert a.shape == image.shape and float(a[:, ~brain].abs().max()) == 0.0
+        inside = a[:, brain]
+        assert torch.allclose(inside.mean(1), torch.zeros(4), atol=1e-4) and torch.allclose(inside.std(1), torch.ones(4), atol=1e-2)
+        assert not torch.allclose(a, image)
+    assert parse_shift("none") is None
+
+
+def test_bootstrap_audit_reports_cis_and_paired_tests():
+    import numpy as np
+
+    from trace_seg3d.audit import bootstrap_audit
+
+    rng = np.random.default_rng(0)
+    dice = rng.uniform(0.3, 0.95, 60)
+    rows = [{"case_id": str(i), "final_mean_dice": str(d), "good": str(1 - d + rng.normal(0, 0.02)), "entropy_mean": str(rng.uniform())}
+            for i, d in enumerate(dice)]
+    res = bootstrap_audit([rows], "final_mean_dice", None, 0.2, ["good", "entropy_mean"], refs=("entropy_mean",), n_boot=200)
+    good = res["signals"]["good"]
+    assert good["auroc"]["value"] > 0.9 and good["auroc"]["ci95"][0] <= good["auroc"]["value"] <= good["auroc"]["ci95"][1]
+    assert good["delta_auroc_vs_entropy_mean"]["p"] < 0.05

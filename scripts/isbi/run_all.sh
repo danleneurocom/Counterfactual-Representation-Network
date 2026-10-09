@@ -27,11 +27,12 @@ RUNS="${RUNS:-runs/isbi}"
 RESULTS="${RESULTS:-results/isbi}"
 SOURCES="${SOURCES:-utsw brats}"
 SEEDS="${SEEDS:-0 1 2}"
-ABL_SEEDS="${ABL_SEEDS:-0}"
+ABL_SEEDS="${ABL_SEEDS-0}"
 EPOCHS="${EPOCHS:-150}"
 WORKERS="${WORKERS:-4}"
 AMP="${AMP:-1}"
 CCT_K="${CCT_K:-4}"
+SAVE_MAPS="${SAVE_MAPS:-6}"   # qualitative maps per eval (~20-40 MB each)
 SKIP_EXISTING="${SKIP_EXISTING:-1}"
 EXTRA_TRAIN_ARGS="${EXTRA_TRAIN_ARGS:-}"   # e.g. "--base-channels 8 --patch-size 48" for smoke tests
 STEPS="${STEPS:-train calib eval audit tables}"
@@ -47,14 +48,15 @@ declare -A ABLATION_ARGS=(
   [trace_nostab]="--mode trace --no-stability"
   [trace_noproxy]="--mode trace --no-proxies"
 )
-MAIN_METHODS="${MAIN_METHODS:-baseline styleaug trace}"
-ABLATIONS="${ABLATIONS:-trace_nocct trace_nostab trace_noproxy}"
+MAIN_METHODS="${MAIN_METHODS-baseline styleaug trace}"  # set to "" to skip
+ABLATIONS="${ABLATIONS-trace_nocct trace_nostab trace_noproxy}"  # set to "" to skip
 
 amp_flag=""; [[ "$AMP" == "1" ]] && amp_flag="--amp"
 data_of()  { [[ "$1" == "utsw" ]] && echo "$DATA_UTSW"  || echo "$DATA_BRATS"; }
 split_of() { [[ "$1" == "utsw" ]] && echo "$SPLIT_UTSW" || echo "$SPLIT_BRATS"; }
 other_of() { [[ "$1" == "utsw" ]] && echo "brats" || echo "utsw"; }
 want() { [[ " $STEPS " == *" $1 "* ]]; }
+have() { [[ -f "$(split_of "$1")" && -d "$(data_of "$1")" ]]; }  # dataset preprocessed + split exists
 
 runs_for() {  # prints "method seed flags" lines
   for m in $MAIN_METHODS; do for s in $SEEDS; do echo "$m|$s|${METHOD_ARGS[$m]}"; done; done
@@ -63,6 +65,10 @@ runs_for() {  # prints "method seed flags" lines
 
 for src in $SOURCES; do
   tgt="$(other_of "$src")"
+  if ! have "$src"; then
+    echo "!! source '$src' skipped: missing $(data_of "$src") or $(split_of "$src") (run preprocess + splits first)"
+    continue
+  fi
   while IFS='|' read -r method seed flags; do
     out="$RUNS/$src/${method}_s${seed}"
     if want train; then
@@ -88,12 +94,13 @@ for src in $SOURCES; do
       ens=()
       for s in $SEEDS; do [[ "$s" != "$seed" && -f "$RUNS/$src/${method}_s${s}/best.pt" ]] && ens+=("$RUNS/$src/${method}_s${s}/best.pt"); done
       for target in "$src" "$tgt"; do
+        if ! have "$target"; then echo "[skip eval] target '$target' not available"; continue; fi
         ev="$out/eval_${target}_test"
         if [[ "$SKIP_EXISTING" == "1" && -f "$ev/summary.json" ]]; then echo "[skip eval] $ev"; continue; fi
         echo "[eval] $ev"
         "$PY" -m trace_seg3d.evaluate --ckpt "$out/best.pt" --calib "$out/calib.json" \
           --data-dir "$(data_of "$target")" --splits "$(split_of "$target")" --split test \
-          --cct-k "$CCT_K" --tta --save-maps 6 --workers "$WORKERS" $amp_flag --out "$ev" \
+          --cct-k "$CCT_K" --tta --save-maps "$SAVE_MAPS" --workers "$WORKERS" $amp_flag --out "$ev" \
           ${ens:+--ensemble-ckpts "${ens[@]}"}
       done
     done < <(runs_for)

@@ -1,6 +1,6 @@
 """Sanity checks after preprocessing -- run this BEFORE training and look at the PNG.
 
-* modality order: inside ET the T1CE channel must be the brightest (z-score); inside edema
+* modality order: inside ET the T1CE channel must be clearly brighter than T1 (enhancement); inside edema
   FLAIR/T2 are bright and T1 is dark. A wrong order in the BraTS h5 export shows up here.
 * orientation: mid-slices of a few cases from each dataset side by side (same view should
   look the same way up / left-right).
@@ -46,9 +46,13 @@ def report(data_dir: Path) -> list[str]:
         txt = "  ".join(f"{k}={v:+.2f}" for k, v in med.items())
         lines.append(f"   median z in {region[8:].upper()}: {txt}")
         if expect:
-            frac = np.mean([max(m, key=m.get) == expect for m in parsed])
-            flag = "OK" if frac > 0.7 else "!! CHECK MODALITY ORDER"
-            lines.append(f"   T1CE brightest inside ET in {frac:.0%} of cases  {flag}")
+            # Enhancement = T1CE much brighter than native T1 inside ET. (FLAIR is often just as
+            # bright as T1CE inside ET, so "T1CE is the brightest channel" is not a reliable test.)
+            frac = np.mean([m["t1ce"] - m["t1"] > 0.5 for m in parsed])
+            flag = "OK" if frac > 0.7 else "!! CHECK MODALITY ORDER (t1/t1ce swapped?)"
+            lines.append(f"   T1CE > T1 + 0.5 inside ET (contrast enhancement) in {frac:.0%} of cases  {flag}")
+            top = np.mean([max(m, key=m.get) == expect for m in parsed])
+            lines.append(f"   (info) T1CE is the single brightest channel in ET in {top:.0%} of cases; FLAIR competing is normal")
     return lines
 
 
